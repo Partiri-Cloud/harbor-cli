@@ -1,0 +1,20 @@
+{
+  "name": "@partiri/cli",
+  "version": "0.2.7",
+  "description": "Partiri CLI — Deploy and manage services on Partiri Cloud",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Partiri-Cloud/harbor-cli.git"
+  },
+  "homepage": "https://partiri.cloud",
+  "bin": {
+    "partiri": "bin/partiri.js"
+  },
+  "optionalDependencies": {
+    "@partiri/cli-linux-x64": "0.2.7",
+    "@partiri/cli-linux-arm64": "0.2.7",
+    "@partiri/cli-darwin-x64": "0.2.7",
+    "@partiri/cli-darwin-arm64": "0.2.7"
+  }
+}

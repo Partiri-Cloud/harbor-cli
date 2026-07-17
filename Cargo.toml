@@ -1,0 +1,63 @@
+[package]
+name = "partiri-cli"
+version = "0.2.7"
+edition = "2021"
+description = "Partiri CLI — Deploy and manage services on Partiri Cloud"
+license = "MIT"
+repository = "https://github.com/partiri-cloud/harbor-cli"
+homepage = "https://partiri.cloud"
+readme = "README.md"
+keywords = ["cli", "cloud", "deploy", "partiri"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "partiri"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "6.0"
+
+# HTTP client — blocking, rustls, no async runtime
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+# Interactive prompts (select, text, confirm)
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+
+# Terminal tables
+tabled = { version = "0.20", features = ["ansi"] }
+
+# Colors — respects NO_COLOR env var
+owo-colors = { version = "4", features = ["supports-colors"] }
+
+# Parse Cargo.toml, pyproject.toml for project detection
+toml = "1.0"
+
+# JSON5 parser — handles .jsonc files (comments, trailing commas)
+json5 = "1.3"
+
+# JSON Schema generation for `partiri llm schema`
+schemars = "0.8"
+
+# Open the user's default browser for `partiri auth login`
+webbrowser = "1"
+
+# OS-backed RNG for the login flow's CSRF state token
+getrandom = "0.2"
+
+[dev-dependencies]
+# Mock HTTP server (works with blocking reqwest — mockito is async-only since v1.0)
+httpmock = "0.8"
+# Property-based testing for validate_config
+proptest = "1"
+# Temp directories for config/auth file I/O tests
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
+panic = "abort"
+opt-level = 3

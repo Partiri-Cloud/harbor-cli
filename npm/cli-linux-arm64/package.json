@@ -1,0 +1,16 @@
+{
+  "name": "@partiri/cli-linux-arm64",
+  "version": "0.2.7",
+  "description": "Partiri CLI binary for Linux arm64",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Partiri-Cloud/harbor-cli.git"
+  }
+}

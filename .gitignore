@@ -1,0 +1,15 @@
+/target
+
+# npm platform package binaries (populated by CI during release).
+# Ignore only the compiled binaries — the package.json manifests, the
+# launcher (npm/partiri/bin/partiri.js) and the bin/.gitkeep files must be
+# tracked so `npm publish` works.
+npm/*/bin/partiri
+npm/*/bin/partiri.exe
+
+# Local Claude Code settings — personal to each contributor, never shared
+.claude/settings.local.json
+
+# Local env / secret files — never commit
+.env
+.env.*
