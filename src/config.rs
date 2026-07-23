@@ -260,7 +260,7 @@ impl PartiriConfig {
                 .enriched(),
             ) as crate::error::Error
         })?;
-        let config: Self = json5::from_str(&content).map_err(|e| {
+        let config: Self = Self::parse_str(&content).map_err(|e| {
             Box::new(
                 crate::error::CliError::new(
                     "config",
@@ -271,6 +271,13 @@ impl PartiriConfig {
             ) as crate::error::Error
         })?;
         Ok(config)
+    }
+
+    /// Parse a `.partiri.jsonc` document from an in-memory string (JSON5:
+    /// comments and trailing commas allowed). Used by `load_from` and by the
+    /// `partiri lsp` server, which validates unsaved editor buffers.
+    pub(crate) fn parse_str(content: &str) -> std::result::Result<Self, json5::Error> {
+        json5::from_str(content)
     }
 
     /// Write the config back to the active config path (the `--config`

@@ -257,6 +257,9 @@ fn run(cli: Cli) -> error::Result<()> {
         }
         Commands::Llm(LlmCommands::Next) => modules::llm::run_next()?,
 
+        #[cfg(feature = "lsp")]
+        Commands::Lsp => modules::lsp::run()?,
+
         Commands::Mcp(McpCommands::Install { client }) => {
             modules::mcp::install::run(client.as_deref())?;
         }

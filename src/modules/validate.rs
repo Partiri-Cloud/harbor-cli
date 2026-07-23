@@ -44,6 +44,33 @@ pub fn run(config: &PartiriConfig) -> Result<()> {
 /// health-check probe).
 pub fn run_remote(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let mut rows: Vec<CheckRow> = static_check_rows(config);
+    rows.extend(collect_remote_checks(client, config));
+
+    let has_fail = rows.iter().any(|r| r.is_fail());
+    let table_rows: Vec<ValidationRow> = rows.into_iter().map(|r| r.into_row()).collect();
+    print_table(table_rows);
+
+    if has_fail {
+        return Err(Box::new(
+            CliError::new(
+                "validation",
+                "Remote validation failed. Fix the failures above and re-run.",
+            )
+            .with_hint("Run 'partiri llm next' or 'partiri llm doctor' for next-step suggestions.")
+            .enriched(),
+        ));
+    } else if !ctx().json {
+        println!("\n{} all remote checks passed", "✓".green().bold());
+    }
+    Ok(())
+}
+
+/// Run only the live API checks and return them as structured rows, without
+/// printing. Shared by [`run_remote`] (which prepends the static rows and
+/// renders a table) and the `partiri lsp` server (which maps the rows to
+/// on-save diagnostics).
+pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) -> Vec<CheckRow> {
+    let mut rows: Vec<CheckRow> = Vec::new();
 
     // ── UUIDs exist & belong to user ─────────────────────────────────────────
     let workspaces = client.list_workspaces();
@@ -283,55 +310,39 @@ pub fn run_remote(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
         }
     }
 
-    let has_fail = rows.iter().any(|r| r.is_fail());
-    let table_rows: Vec<ValidationRow> = rows.into_iter().map(|r| r.into_row()).collect();
-    print_table(table_rows);
-
-    if has_fail {
-        return Err(Box::new(
-            CliError::new(
-                "validation",
-                "Remote validation failed. Fix the failures above and re-run.",
-            )
-            .with_hint("Run 'partiri llm next' or 'partiri llm doctor' for next-step suggestions.")
-            .enriched(),
-        ));
-    } else if !ctx().json {
-        println!("\n{} all remote checks passed", "✓".green().bold());
-    }
-    Ok(())
+    rows
 }
 
 // ─── Internal row helper ─────────────────────────────────────────────────────
 
-enum Status {
+pub(crate) enum Status {
     Ok,
     Warn,
     Fail,
 }
 
-struct CheckRow {
-    field: String,
-    status: Status,
-    message: String,
+pub(crate) struct CheckRow {
+    pub(crate) field: String,
+    pub(crate) status: Status,
+    pub(crate) message: String,
 }
 
 impl CheckRow {
-    fn ok(field: &str, message: &str) -> Self {
+    pub(crate) fn ok(field: &str, message: &str) -> Self {
         Self {
             field: field.into(),
             status: Status::Ok,
             message: message.into(),
         }
     }
-    fn warn(field: &str, message: &str) -> Self {
+    pub(crate) fn warn(field: &str, message: &str) -> Self {
         Self {
             field: field.into(),
             status: Status::Warn,
             message: message.into(),
         }
     }
-    fn fail(field: &str, message: &str) -> Self {
+    pub(crate) fn fail(field: &str, message: &str) -> Self {
         Self {
             field: field.into(),
             status: Status::Fail,

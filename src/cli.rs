@@ -79,6 +79,9 @@ pub enum Commands {
     /// Agent helpers — guide, templates, capabilities,context, etc.
     #[command(subcommand)]
     Llm(LlmCommands),
+    /// Run the language server for .partiri.jsonc over stdio (used by editor plugins)
+    #[cfg(feature = "lsp")]
+    Lsp,
 }
 
 #[derive(Subcommand)]

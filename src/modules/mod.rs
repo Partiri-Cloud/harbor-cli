@@ -9,6 +9,8 @@ pub mod common;
 pub mod init;
 pub mod jobs;
 pub mod llm;
+#[cfg(feature = "lsp")]
+pub mod lsp;
 pub mod mcp;
 pub mod pods;
 pub mod projects;

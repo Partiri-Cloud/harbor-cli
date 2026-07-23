@@ -48,7 +48,7 @@ pub fn run_schema() -> Result<()> {
     Ok(())
 }
 
-fn config_schema() -> Value {
+pub(crate) fn config_schema() -> Value {
     let settings = SchemaSettings::draft07().with(|s| {
         s.inline_subschemas = true;
     });
@@ -804,6 +804,19 @@ pub fn run_doctor() -> Result<()> {
 /// regions, pods, secrets, services) in one call. `workspace` scopes the output
 /// to a single workspace.
 pub fn run_context(client: &ApiClient, workspace: Option<String>) -> Result<()> {
+    let payload = build_context(client, workspace)?;
+    if ctx().json {
+        print_result(&payload);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    }
+    Ok(())
+}
+
+/// Build the `llm context` payload without printing it. Shared by
+/// [`run_context`] and the `partiri lsp` server, which caches the result to
+/// power UUID completions in `.partiri.jsonc`.
+pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Result<Value> {
     let workspaces = client.list_workspaces()?;
     let user_email = workspaces.first().and_then(|w| w.email.clone());
 
@@ -889,17 +902,10 @@ pub fn run_context(client: &ApiClient, workspace: Option<String>) -> Result<()> 
         }));
     }
 
-    let payload = json!({
+    Ok(json!({
         "user": { "email": user_email },
         "workspaces": ws_payload,
-    });
-
-    if ctx().json {
-        print_result(&payload);
-    } else {
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
-    }
-    Ok(())
+    }))
 }
 
 // ─── next ───────────────────────────────────────────────────────────────────
