@@ -162,17 +162,18 @@ pub struct ServiceConfig {
     /// Whether the service is active.
     pub active: bool,
 
-    /// Persistent disk (PVC) to create and attach to this service.
+    /// Persistent disk (PVC) declared for this service.
     ///
-    /// When set, `service create` creates the volume with `fk_service` pointing
-    /// at the newly created service so it auto-attaches once provisioned. On
-    /// `service push`, the reconcile logic compares this with the live volume
-    /// state and detaches/deletes/recreates as needed. Remove this block (or
-    /// set it to `null`) to detach the disk on next push.
-    // `disk` is persisted to `.partiri.jsonc` via `to_jsonc_string` and reconciled into a
-    // separate Volume resource (`POST /storage/volumes`). It is NOT a column on the services
-    // table, so it must never be serialized into the `POST`/`PUT /services` body — the API
-    // rejects unknown columns. Deserialize-only: read from the config file, never sent inline.
+    /// Declarative config only: `service create` and `service push` never
+    /// provision, resize, or delete the volume. `partiri storage create`
+    /// provisions it (bound via `fk_service` so it auto-attaches once
+    /// provisioned) and `partiri storage update` applies size/mount changes.
+    /// `service pull` reads the live volume back into this block.
+    // `disk` is persisted to `.partiri.jsonc` via `to_jsonc_string` and mapped to a separate
+    // Volume resource (`POST`/`PATCH /storage/volumes`) by the `storage` commands. It is NOT a
+    // column on the services table, so it must never be serialized into the `POST`/`PUT
+    // /services` body — the API rejects unknown columns. Deserialize-only: read from the config
+    // file, never sent inline.
     #[serde(default, skip_serializing)]
     pub disk: Option<DiskConfig>,
 
@@ -367,7 +368,8 @@ impl PartiriConfig {
         let disk_section = match &svc.disk {
             Some(d) => format!(
                 r#"
-    // Persistent disk attached to this service. Remove or set to null to detach on next push.
+    // Persistent disk for this service. Declarative only: provision it with
+    // 'partiri storage create' and change it with 'partiri storage update'.
     "disk": {{
       "mount_path": {},
       "size": {}
@@ -376,7 +378,8 @@ impl PartiriConfig {
                 d.size
             ),
             None => r#"
-    // Persistent disk (optional). Example: { "mount_path": "/app/data", "size": 1 }
+    // Persistent disk (optional). Declarative only — run 'partiri storage create' to
+    // provision it. Example: { "mount_path": "/app/data", "size": 1 }
     // "disk": null,"#
                 .to_string(),
         };

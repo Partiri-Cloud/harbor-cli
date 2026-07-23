@@ -81,7 +81,8 @@ fn config_schema() -> Value {
                 "fk_region and fk_pod must belong to the same workspace.",
                 "Environment variables are managed via 'partiri service env --path <.env>'; they are never stored in .partiri.jsonc.",
                 "service.disk requires a single-region service. Adding a second replica/region while a disk is attached returns a storage_replica_conflict error.",
-                "There is no in-place PVC resize. To change disk size: remove the disk block, push (detaches+deletes), then set the new disk block and push again.",
+                "The disk block is declarative config only. 'service create' and 'service push' never provision or change the volume — run 'partiri storage create' to provision it and 'partiri storage update' to resize (grow only) or remount it.",
+                "PVCs can grow but never shrink. 'storage update' rejects a size decrease; to start smaller, detach+delete the volume (destroys data) and 'storage create' a new one.",
             ]),
         );
     }
@@ -338,7 +339,7 @@ pub fn run_examples() -> Result<()> {
         },
         {
             "name": "service-with-persistent-disk",
-            "description": "Service with a persistent disk. Add a disk block to .partiri.jsonc; the volume is created and auto-attached on service create/push.",
+            "description": "Service with a persistent disk. Declare a disk block in .partiri.jsonc, then provision the volume with 'partiri storage create' — service create/push never touch storage.",
             "note": "Disk services are single-region only. The $PORT env var must still be used for the listening port.",
             "disk_block_example": {
                 "disk": {
@@ -349,8 +350,12 @@ pub fn run_examples() -> Result<()> {
             "commands": [
                 "# Add disk block to .partiri.jsonc (see disk_block_example above)",
                 "partiri -j -y service create",
+                "# Provision the volume declared in the disk block (auto-attaches on provision):",
+                "partiri -j storage create",
                 "partiri -j -y service deploy",
-                "# To inspect volumes later:",
+                "# To resize (grow only) or remount later: edit the disk block, then:",
+                "partiri -j storage update",
+                "# To inspect volumes:",
                 "partiri -j storage list --project <PROJECT_UUID>",
                 "partiri -j storage show <VOLUME_UUID>",
                 "# To detach and delete:",
@@ -586,9 +591,16 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
             "Your service MUST listen on the port given by the $PORT environment variable. Hard-coding a port causes health-check failures.",
         ],
         "service push" => vec![
-            "Destructive operation — pass -y to skip the confirmation in non-TTY/script mode.",
-            "A disk configuration change (different mount_path or size) is a destructive recreate: the existing volume and ALL its data will be deleted. This requires explicit confirmation; in non-TTY mode you must pass -y.",
-            "Removing the disk block detaches the volume but does NOT delete it — data is preserved and billing continues until you run 'partiri storage delete <UUID>'.",
+            "Updates only the service row; it never provisions, resizes, detaches, or deletes a volume.",
+            "If the local disk block diverges from the live volume, push prints a hint (run 'partiri storage create' or 'partiri storage update') but applies nothing to storage.",
+        ],
+        "storage create" => vec![
+            "Provisions the volume declared in the '.partiri.jsonc' service.disk block and attaches it to the service (auto-attaches once provisioned).",
+            "Requires the service to exist (an 'id' in the config) and a valid disk block. Fails if the service already has a volume — use 'storage update' to change an existing one.",
+        ],
+        "storage update" => vec![
+            "Applies the service.disk block to the service's existing volume: grows the size (prorated charge) and/or changes the mount path (redeploys the service).",
+            "Only sends the fields that differ from the live volume. A size decrease is rejected — PVCs cannot shrink.",
         ],
         "service kill" => vec![
             "Destructive operation — pass -y to skip the confirmation in scripts.",

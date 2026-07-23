@@ -382,6 +382,25 @@ struct AttachVolumeBody<'a> {
     service_id: &'a str,
 }
 
+/// Request body for `PATCH /storage/volumes/:id` (mirrors the API's
+/// `VolumeUpdateInput`). Only the fields that actually changed are sent — a
+/// mount-path-only change redeploys the service, a size increase prorates and
+/// charges the delta, and a size decrease is rejected server-side.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct VolumeUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
+}
+
+impl VolumeUpdate {
+    /// Whether this update carries no field changes (nothing to PATCH).
+    pub fn is_empty(&self) -> bool {
+        self.size.is_none() && self.mount_path.is_none()
+    }
+}
+
 /// Request body for `POST /services` — a [`ServiceConfig`] flattened together
 /// with its project and workspace UUIDs.
 #[derive(Debug, serde::Serialize)]
@@ -440,6 +459,20 @@ impl ApiClient {
             base_url,
             api_key,
         })
+    }
+
+    /// Build a client pointed at an arbitrary base URL (e.g. a `MockServer`),
+    /// bypassing the credentials file and HTTPS check. Test-only so command
+    /// modules can exercise their `run_*` handlers against a mock API.
+    #[cfg(test)]
+    pub(crate) fn for_test(base_url: String) -> Self {
+        ApiClient {
+            agent: ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(5))
+                .build(),
+            base_url,
+            api_key: "test-api-key".to_string(),
+        }
     }
 
     // ─── Internal HTTP helpers ────────────────────────────────────────────────
@@ -546,6 +579,19 @@ impl ApiClient {
         })?;
         spinner.finish_and_clear();
         self.handle_response_empty(response)
+    }
+
+    fn patch<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        let spinner = new_spinner();
+        let response = self.send_with_retry(|| {
+            self.agent
+                .request("PATCH", &format!("{}{}", self.base_url, path))
+                .set("x-api-key", &self.api_key)
+                .send_json(body)
+                .map_err(Box::new)
+        })?;
+        spinner.finish_and_clear();
+        self.handle_response(response)
     }
 
     fn error_message(response: Response) -> crate::error::Error {
@@ -877,6 +923,13 @@ impl ApiClient {
     /// Read a single volume by UUID (`GET /storage/volumes/:id`).
     pub fn read_volume(&self, id: &str) -> Result<Volume> {
         self.get(&format!("/storage/volumes/{}", id))
+    }
+
+    /// Update a volume's size and/or mount path (`PATCH /storage/volumes/:id`).
+    /// A size increase prorates and charges the delta; a mount-path change
+    /// redeploys the service. Shrinking is rejected by the API.
+    pub fn update_volume(&self, volume_id: &str, changes: &VolumeUpdate) -> Result<Volume> {
+        self.patch(&format!("/storage/volumes/{}", volume_id), changes)
     }
 
     /// Attach an available volume to a service (`PUT /storage/volumes/:id/attach`).
@@ -1775,6 +1828,56 @@ mod tests {
 
         test_client(&server).retry_volume("vol-fail").unwrap();
         mock.assert();
+    }
+
+    #[test]
+    fn update_volume_sends_patch_with_changed_fields() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("PATCH")
+                .path("/storage/volumes/vol-up")
+                .json_body(json!({ "size": 8, "mount_path": "/app/storage" }));
+            then.status(200).json_body(json!({
+                "id": "vol-up", "name": "d", "fk_project": "p",
+                "fk_workspace": "w", "fk_region": "r",
+                "fk_service": "svc-1", "mount_path": "/app/storage",
+                "size": 8, "status": "attached"
+            }));
+        });
+
+        let changes = crate::client::VolumeUpdate {
+            size: Some(8),
+            mount_path: Some("/app/storage".to_string()),
+        };
+        let vol = test_client(&server)
+            .update_volume("vol-up", &changes)
+            .unwrap();
+        mock.assert();
+        assert_eq!(vol.size, 8);
+        assert_eq!(vol.mount_path, "/app/storage");
+    }
+
+    #[test]
+    fn volume_update_omits_none_fields() {
+        // A size-only update must not carry a null mount_path — the API's
+        // `VolumeUpdateInput` distinguishes "unset" from a value.
+        let changes = crate::client::VolumeUpdate {
+            size: Some(4),
+            mount_path: None,
+        };
+        let json = serde_json::to_string(&changes).unwrap();
+        assert!(json.contains("\"size\""), "{json}");
+        assert!(!json.contains("mount_path"), "{json}");
+    }
+
+    #[test]
+    fn volume_update_is_empty_reports_no_changes() {
+        assert!(crate::client::VolumeUpdate::default().is_empty());
+        assert!(!crate::client::VolumeUpdate {
+            size: Some(2),
+            mount_path: None,
+        }
+        .is_empty());
     }
 
     // ─── Cost math (pure, no HTTP) ────────────────────────────────────────────

@@ -121,9 +121,12 @@ fn run(cli: Cli) -> error::Result<()> {
         }
 
         // Pull does not require an existing config file
-        Commands::Service(ServiceCommands::Pull) => {
+        Commands::Service(ServiceCommands::Pull { service }) => {
             let client = ApiClient::new()?;
-            modules::service::pull::run(&client)?;
+            match service {
+                Some(id) => modules::service::pull::run_by_id(&client, &id)?,
+                None => modules::service::pull::run(&client)?,
+            }
         }
 
         // Deploy by explicit UUID bypasses `.partiri.jsonc` entirely.
@@ -188,7 +191,7 @@ fn run(cli: Cli) -> error::Result<()> {
                 ServiceCommands::Env { path, save } => {
                     modules::service::env::run(&client, config, path, save)?
                 }
-                ServiceCommands::List { .. } | ServiceCommands::Pull => unreachable!(),
+                ServiceCommands::List { .. } | ServiceCommands::Pull { .. } => unreachable!(),
             }
         }
 
@@ -307,6 +310,19 @@ fn run(cli: Cli) -> error::Result<()> {
             }
         }
 
+        // Create/update read the `disk` block from `.partiri.jsonc`, so they
+        // need the local config; the rest operate on a volume UUID directly.
+        Commands::Storage(StorageCommands::Create) => {
+            let client = ApiClient::new()?;
+            let config = PartiriConfig::load()?;
+            modules::storage::run_create(&client, &config)?;
+        }
+        Commands::Storage(StorageCommands::Update) => {
+            let client = ApiClient::new()?;
+            let config = PartiriConfig::load()?;
+            modules::storage::run_update(&client, &config)?;
+        }
+
         Commands::Storage(cmd) => {
             let client = ApiClient::new()?;
             match cmd {
@@ -316,6 +332,7 @@ fn run(cli: Cli) -> error::Result<()> {
                 StorageCommands::Show { id } => modules::storage::run_show(&client, &id)?,
                 StorageCommands::Detach { id } => modules::storage::run_detach(&client, &id)?,
                 StorageCommands::Delete { id } => modules::storage::run_delete(&client, &id)?,
+                StorageCommands::Create | StorageCommands::Update => unreachable!(),
             }
         }
     }

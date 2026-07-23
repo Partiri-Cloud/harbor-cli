@@ -200,8 +200,9 @@ partiri -j secrets list --workspace <UUID>
 
 ### Attach persistent storage to a service
 
-Add a `disk` block to `.partiri.jsonc` before calling `service create`, or add it
-later and reconcile with `service push`:
+The `disk` block in `.partiri.jsonc` is **declarative config only**. `service create`
+and `service push` never provision or change the volume — the `storage` commands do.
+Declare the disk, then run `storage create`:
 
 ```jsonc
 // .partiri.jsonc
@@ -215,30 +216,28 @@ later and reconcile with `service push`:
 ```
 
 ```sh
-partiri -j -y service create    # creates the service + volume; auto-attaches on provision
-# — or, for an existing service —
-partiri -j -y service push      # reconciles: creates, resizes, or removes the volume
+partiri -j -y service create   # creates the SERVICE only (no volume)
+partiri -j storage create      # provisions the volume from the disk block; auto-attaches
 ```
 
-**Disk reconcile outcomes on `service push`:**
+**How each command treats the `disk` block:**
 
-| `.partiri.jsonc` `disk` | Live volume | Result |
-|---|---|---|
-| Same `mount_path` + `size` | exists | no-op |
-| Added | none | creates and attaches the volume |
-| `mount_path` or `size` changed | exists | **confirms then: detach → delete → recreate** (data lost) |
-| Removed / set to `null` | exists | detaches only — data preserved; prints a hint to `partiri storage delete <id>` |
-| Absent | none | no-op |
+| Command | Effect on the volume |
+|---|---|
+| `service create` | none — creates the service row only |
+| `service push` | none — updates the service row; prints a hint if the disk block diverges from the live volume |
+| `service pull` | adopts the live volume's mount path and size into the disk block when a volume exists (warns if it replaces a diverging local edit); preserves a block declared for a not-yet-run `storage create` |
+| `storage create` | provisions the volume declared in the disk block and attaches it (fails if one already exists) |
+| `storage update` | applies the disk block to the existing volume: grows size (prorated) and/or changes mount path |
 
-A disk change (resize or remount) **destroys all data** and **prompts for confirmation**. In
-CI or non-TTY environments pass `-y` to auto-confirm, or the command errors out.
-
-Removing the `disk` block detaches the volume but does **not** delete it. The volume
-remains billable until you explicitly run:
+**Resize or remount** — edit the disk block, then:
 
 ```sh
-partiri storage delete <VOLUME_UUID>
+partiri -j storage update      # grows the PVC and/or remounts; a size decrease is rejected
 ```
+
+PVCs can grow but **never shrink**. To start smaller you must `storage detach` +
+`storage delete` (destroys data) and `storage create` a new one.
 
 **Storage constraints**: a service with a disk is pinned to the region where the volume was
 created. Multi-region deployment is not possible while a disk is attached (enforced by the API).
@@ -246,14 +245,17 @@ created. Multi-region deployment is not possible while a disk is attached (enfor
 ### Manage storage volumes directly
 
 ```sh
+partiri -j storage create                   # provision the volume from the local disk block
+partiri -j storage update                   # apply disk-block changes (grow / remount) to it
 partiri -j storage list --project <UUID>    # list all volumes in a project
 partiri -j storage show <VOLUME_UUID>       # show details for one volume
 partiri -j -y storage detach <VOLUME_UUID>  # detach (service must be paused, no active jobs)
 partiri -j -y storage delete <VOLUME_UUID>  # delete (must be detached first)
 ```
 
-`storage detach` requires the service to be paused and have no active job. The CLI surfaces the
-API's 400 with a clear hint rather than checking job state itself.
+`storage create` and `storage update` read `service.disk` and the service `id` from the local
+`.partiri.jsonc`. `storage detach` requires the service to be paused and have no active job; the
+CLI surfaces the API's 400 with a clear hint rather than checking job state itself.
 
 ### Set runtime environment variables
 
@@ -341,8 +343,10 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **`health_check_path` accepts either a path or an absolute URL.** Only absolute URLs are probed by `validate --remote`; relative paths are deferred to runtime.
 - **`deploy_tag` is set by the deploy job once it succeeds — not synchronously by `service deploy`.** The deploy is async, so the tag may still be empty right after the POST returns. `service deploy` does a best-effort refresh; if the job is still in progress, run `partiri llm next` (which inspects job status) or `partiri service pull` to refresh later. Required for `partiri service logs` and metrics.
 - **`init --template` refuses to overwrite an existing `.partiri.jsonc`.** Delete the file manually first (or pull the existing service).
-- **Changing `disk.mount_path` or `disk.size` destroys all volume data.** The `service push` disk-changed path runs detach → delete → recreate. Always prompt for confirmation; pass `-y` in CI.
-- **Removing the `disk` block only detaches — the volume still exists and accrues cost.** Run `partiri storage delete <VOLUME_UUID>` to remove it entirely.
+- **The `disk` block is config only — `service create`/`service push` never touch storage.** Provision the volume with `partiri storage create` and change it with `partiri storage update`. `service push` prints a hint when the block diverges from the live volume, but applies nothing.
+- **`storage update` grows a volume but cannot shrink it.** A size increase is prorated and charged; a decrease is rejected (Kubernetes cannot shrink a PVC). To start smaller, `storage detach` + `storage delete` (destroys data), then `storage create`.
+- **Removing the `disk` block does not remove the volume.** The volume keeps existing and accruing cost until you run `partiri storage detach <UUID>` then `partiri storage delete <UUID>`.
+- **`service pull` adopts the live volume's mount path and size into the `disk` block when a live volume exists.** It mirrors reality: a pending local disk edit you have not applied via `storage update` is replaced by the live values (pull warns when it does so). When there is no live volume the block is preserved, so a disk declared for a not-yet-run `storage create` survives the pull.
 - **A service with a disk cannot be multi-region.** The API enforces single-region placement when a persistent volume is attached.
 - **`storage detach` requires the service to be paused.** Pause first with `partiri service pause`, then detach, then optionally delete.
 - **Balance warnings from `validate --remote` are non-blocking.** The `remote.balance` row is a warn, not a fail. The API itself returns 402 when the balance is insufficient — that is the hard backstop.

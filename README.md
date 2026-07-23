@@ -189,14 +189,18 @@ echo "$GH_TOKEN" | partiri secrets create-repository \
 
 ### `partiri storage <subcommand>`
 
-Manage persistent volumes attached to services. Volumes are provisioned via the `disk` block in `.partiri.jsonc` and can be inspected or manually detached and deleted here. See the [disk field reference](#field-reference) for how to declare a volume in config.
+Provision and manage persistent volumes for a service. The `disk` block in `.partiri.jsonc` is declarative config only — `service create` and `service push` never touch storage. `partiri storage create` provisions the volume from that block, and `partiri storage update` applies changes to it. See the [disk field reference](#field-reference) for how to declare a volume in config.
 
 | Subcommand                       | Description                                                   |
 |----------------------------------|---------------------------------------------------------------|
+| `partiri storage create`         | Provision the volume declared in the `service.disk` block and attach it |
+| `partiri storage update`         | Apply the `service.disk` block to the existing volume (grow / remount)  |
 | `partiri storage list`           | List all volumes in a project                                 |
 | `partiri storage show <UUID>`    | Show full details for a specific volume                       |
 | `partiri storage detach <UUID>`  | Detach a volume from its service (pause the service first)    |
 | `partiri storage delete <UUID>`  | Delete a volume (must be detached first)                      |
+
+**`partiri storage create`** and **`partiri storage update`** take no arguments — they read `service.disk` and the service `id` from the local `.partiri.jsonc`. `create` fails if the service already has a volume; `update` grows the size (prorated charge) and/or changes the mount path, and rejects a size decrease (a PVC cannot shrink).
 
 **`partiri storage list`** flags:
 
@@ -208,6 +212,8 @@ Manage persistent volumes attached to services. Volumes are provisioned via the 
 **`partiri storage show`**, **`partiri storage detach`**, and **`partiri storage delete`** each take a single positional volume UUID:
 
 ```bash
+partiri storage create                 # provision the volume from the local disk block
+partiri storage update                 # apply disk-block changes to it (grow / remount)
 partiri storage list --project <UUID>
 partiri storage show <VOLUME-UUID>
 partiri storage detach <VOLUME-UUID>   # service must be paused first
@@ -302,9 +308,9 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
     "maintenance_mode": false,
     "active": true,
 
-    // Persistent disk (optional). Provisions and attaches a volume on service create/push.
-    // Remove or set to null to detach on the next push.
-    // Manage volumes with 'partiri storage list/show/detach/delete'.
+    // Persistent disk (optional). Declarative only — provision it with
+    // 'partiri storage create' and change it with 'partiri storage update'.
+    // 'service create'/'service push' never touch storage.
     // "disk": { "mount_path": "/app/data", "size": 1 }
 
     // Environment variables are managed via 'partiri service env --path <.env>'.
@@ -336,7 +342,7 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | `service.fk_region`                | Yes       | Region UUID. List via `partiri regions list --workspace <UUID>`.            |
 | `service.fk_pod`                   | Yes       | Compute pod UUID (CPU/RAM tier). List via `partiri pods list --workspace <UUID>`. |
 | `service.health_check_path`        | No        | Health-check path or absolute URL. `null` disables the check.               |
-| `service.disk`                     | No        | Persistent volume: `{ "mount_path": "/app/data", "size": <1–10 GB> }`. Setting this provisions and attaches a volume on `service create`/`push`; removing it (or setting to `null`) detaches on the next push. Manage volumes with `partiri storage`. |
+| `service.disk`                     | No        | Persistent volume: `{ "mount_path": "/app/data", "size": <1–10 GB> }`. Declarative config only — provision the volume with `partiri storage create` and change it with `partiri storage update`. `service create`/`push` never touch storage; `service pull` adopts the live volume's mount path and size into this block when a volume exists (warning if it replaces a diverging local edit), and preserves a block declared for a not-yet-run `storage create`. |
 | `service.maintenance_mode`         | No        | Serve a maintenance page instead of the app.                                |
 | `service.active`                   | No        | Whether the service is active.                                              |
 

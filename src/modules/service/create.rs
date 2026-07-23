@@ -7,8 +7,12 @@ use crate::config::{validate_config, PartiriConfig};
 use crate::error::{CliError, Result};
 use crate::output::{ctx, print_success_with};
 
-/// Estimate the monthly cost using region pricing. Returns `None` when pricing
-/// is unavailable (non-fatal: the create succeeds regardless).
+/// Estimate the service's monthly pod cost using region pricing. Returns `None`
+/// when pricing is unavailable (non-fatal: the create succeeds regardless).
+///
+/// Storage is excluded: `service create` never provisions the volume (that is
+/// `partiri storage create`), so folding the declared `disk` block into this
+/// figure would bill for storage that does not exist yet.
 fn estimate_monthly_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f64> {
     let pricing = client.get_pricing(&config.service.fk_region).ok()?;
     let pod_price = pricing
@@ -17,13 +21,7 @@ fn estimate_monthly_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f
         .find(|p| p.fk_pod == config.service.fk_pod)
         .map(|p| p.price)
         .unwrap_or(0.0);
-    let disk_price = config
-        .service
-        .disk
-        .as_ref()
-        .map(|d| pricing.volume_price_per_gb * f64::from(d.size))
-        .unwrap_or(0.0);
-    Some(pod_price + disk_price)
+    Some(pod_price)
 }
 
 /// Entry point for `partiri service create`. Refuses if the config already has
@@ -76,36 +74,6 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
     // Estimate monthly cost (non-fatal if pricing is unavailable)
     let monthly_cost = estimate_monthly_cost(client, &config);
 
-    // If a disk block is configured, create the volume bound to this service.
-    // Passing fk_service causes the volume to auto-attach once provisioned.
-    if let Some(disk) = &config.service.disk {
-        let vol_name = derive_volume_name(&config.service.name);
-        let volume = crate::client::Volume {
-            id: None,
-            name: vol_name,
-            fk_project: config.fk_project.clone(),
-            fk_workspace: config.fk_workspace.clone(),
-            fk_region: config.service.fk_region.clone(),
-            fk_service: Some(service.id.clone()),
-            mount_path: disk.mount_path.clone(),
-            size: disk.size,
-            status: "pending".to_string(),
-            created_at: None,
-        };
-        if let Err(e) = client.create_volume(&volume) {
-            // Volume creation failure is surfaced but does not undo the service
-            // (the service is already created). The user can retry disk creation
-            // via a future `service push`.
-            if !ctx().json {
-                eprintln!(
-                    "  {} disk creation failed: {}. Run 'partiri service push' to retry.",
-                    "warn:".yellow(),
-                    e
-                );
-            }
-        }
-    }
-
     // JSON envelope carries plain strings (no ANSI). Trailing tip lines are
     // human-only — gate them on !ctx().json so we keep the "exactly one
     // structured result per invocation" stdout contract.
@@ -122,7 +90,14 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
             println!("  External URL: {}", url.cyan());
         }
         if let Some(cost) = monthly_cost {
-            println!("  Estimated monthly cost: €{:.4}", cost);
+            println!("  Estimated monthly pod cost: €{:.4}", cost);
+        }
+        // The disk block, if any, is provisioned separately — never on create.
+        if config.service.disk.is_some() {
+            println!(
+                "  This service declares a disk. Run {} to provision it.",
+                "'partiri storage create'".bold()
+            );
         }
         println!("\n  Run {} to deploy.", "'partiri service deploy'".bold());
     }
@@ -131,11 +106,11 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
 }
 
 /// Derive a K8s-safe volume name from the service name.
-/// `pub(super)` so `push.rs` can reuse the same naming logic.
+/// `pub(crate)` so the `storage` module can reuse the same naming logic.
 /// Mirrors the web frontend: lowercase, non-alphanum/-→hyphens,
 /// collapse runs of hyphens, trim leading/trailing hyphens, cap at 48 chars,
 /// then append "-disk".
-pub(super) fn derive_volume_name(service_name: &str) -> String {
+pub(crate) fn derive_volume_name(service_name: &str) -> String {
     let safe: String = service_name
         .to_lowercase()
         .chars()

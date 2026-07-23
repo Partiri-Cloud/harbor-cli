@@ -147,7 +147,11 @@ pub enum ServiceCommands {
     /// Register the service on Partiri and update .partiri.jsonc
     Create,
     /// Pull an existing service and save it as .partiri.jsonc
-    Pull,
+    Pull {
+        /// Service UUID to pull; skips the interactive selection entirely.
+        #[arg(long, value_name = "UUID")]
+        service: Option<String>,
+    },
     /// List services in a project (discovery; no `.partiri.jsonc` needed)
     List {
         /// Project UUID. Required if you have multiple projects.
@@ -313,6 +317,17 @@ pub enum SecretsCommands {
 
 #[derive(Subcommand)]
 pub enum StorageCommands {
+    /// Create the volume declared in the `service.disk` block of .partiri.jsonc
+    ///
+    /// The size and mount path come from the config file — this is the only
+    /// command that provisions a volume. `service create` and `service push`
+    /// never touch storage.
+    Create,
+    /// Apply the `service.disk` block to the service's existing volume
+    ///
+    /// Resizes (grow only) or remounts the live volume via the API's update
+    /// endpoint. Reads mount path and size from .partiri.jsonc.
+    Update,
     /// List all volumes in a project
     List {
         /// Project UUID. Required if you have multiple projects.
