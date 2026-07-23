@@ -13,3 +13,6 @@ npm/*/bin/partiri.exe
 # Local env / secret files — never commit
 .env
 .env.*
+
+# Scripts
+scripts/
