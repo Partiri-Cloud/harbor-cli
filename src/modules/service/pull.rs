@@ -377,9 +377,18 @@ pub fn run(client: &ApiClient) -> Result<()> {
     Ok(())
 }
 
+/// Treat an empty string from the API as an absent value. The DB stores `''`
+/// (not NULL) in unused optional columns, so a registry-sourced service comes
+/// back with `repository_url: Some("")` — which `to_jsonc_string` would read
+/// as "repository-sourced" and silently drop the real `registry_url`.
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.is_empty())
+}
+
 /// Convert an API [`Service`] into a [`PartiriConfig`], filling in defaults for
 /// missing optional fields. `fk_workspace`/`fk_project` are used as fallbacks
-/// when the API does not echo them back.
+/// when the API does not echo them back. Optional string fields returned as
+/// `''` are normalized to `None` via [`non_empty`].
 ///
 /// # Errors
 ///
@@ -404,21 +413,21 @@ pub(crate) fn map_to_config(
             name: svc.name,
             deploy_type: svc.deploy_type,
             runtime: svc.runtime,
-            root_path: svc.root_path.unwrap_or_else(|| ".".to_string()),
-            repository_url: svc.repository_url,
-            repository_branch: svc.repository_branch,
-            registry_url: svc.registry_url,
-            fk_service_secret: svc.fk_service_secret,
-            build_path: svc.build_path,
-            build_command: svc.build_command,
-            pre_deploy_command: svc.pre_deploy_command,
-            run_command: svc.run_command,
+            root_path: non_empty(svc.root_path).unwrap_or_else(|| ".".to_string()),
+            repository_url: non_empty(svc.repository_url),
+            repository_branch: non_empty(svc.repository_branch),
+            registry_url: non_empty(svc.registry_url),
+            fk_service_secret: non_empty(svc.fk_service_secret),
+            build_path: non_empty(svc.build_path),
+            build_command: non_empty(svc.build_command),
+            pre_deploy_command: non_empty(svc.pre_deploy_command),
+            run_command: non_empty(svc.run_command),
             fk_region,
             fk_pod: svc
                 .fk_pod
                 .filter(|s| !s.is_empty())
                 .ok_or("Pulled service is missing fk_pod")?,
-            health_check_path: svc.health_check_path,
+            health_check_path: non_empty(svc.health_check_path),
             // The volume is a separate resource, not a field on the service, so
             // it is filled in by the caller via `fetch_service_disk` after the
             // project UUID is known. Default to None here.
@@ -797,6 +806,60 @@ mod tests {
         assert!(
             result.is_err(),
             "Empty primary fk_region should return an error"
+        );
+    }
+
+    /// Regression: the DB stores `''` (not NULL) in unused optional columns.
+    /// A registry-sourced service therefore arrives with
+    /// `repository_url: Some("")`, which used to make `to_jsonc_string` pick
+    /// the repository section and drop the real `registry_url` from the
+    /// written config. Payload mirrors a live `GET /services/{id}` response.
+    #[test]
+    fn map_to_config_normalizes_empty_strings_from_the_api() {
+        let svc: Service = serde_json::from_value(serde_json::json!({
+            "id": "svc-123", "name": "webssr",
+            "fk_project": "proj-1", "fk_workspace": "ws-1",
+            "deploy_type": "registry", "runtime": "registry",
+            "registry_url": "ghcr.io/org/image:latest",
+            "repository_url": "", "repository_branch": "",
+            "root_path": "", "build_path": "", "build_command": "",
+            "pre_deploy_command": "", "run_command": "",
+            "health_check_path": "",
+            "deploy_tag": "58564", "fk_pod": "pod-uuid",
+            "maintenance_mode": false, "active": true,
+            "replicas": [{
+                "id": "replica-uuid", "fk_region": "region-uuid", "is_primary": true
+            }]
+        }))
+        .unwrap();
+
+        let config = map_to_config(
+            svc,
+            "svc-123".to_string(),
+            "ws-1".to_string(),
+            "proj-1".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.service.registry_url.as_deref(),
+            Some("ghcr.io/org/image:latest")
+        );
+        assert!(config.service.repository_url.is_none());
+        assert!(config.service.repository_branch.is_none());
+        assert!(config.service.build_command.is_none());
+        assert!(config.service.run_command.is_none());
+        assert!(config.service.health_check_path.is_none());
+        assert_eq!(config.service.root_path, ".");
+
+        let jsonc = config.to_jsonc_string().unwrap();
+        assert!(
+            jsonc.contains("ghcr.io/org/image:latest"),
+            "registry_url must survive into the written config"
+        );
+        assert!(
+            !jsonc.contains(r#""repository_url": """#),
+            "empty repository fields must not be written"
         );
     }
 
