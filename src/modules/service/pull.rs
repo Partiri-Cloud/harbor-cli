@@ -50,10 +50,10 @@ pub fn silent_refresh(client: &ApiClient, existing: &PartiriConfig) -> Result<Pa
 /// replaces a diverging local edit); when there is no live volume the existing
 /// block is preserved, so a disk declared for a not-yet-run `storage create`
 /// survives a pull; and when the storage listing fails it warns and leaves the
-/// block unchanged rather than aborting the whole pull. Either way the
-/// `deploy_tag` refresh and the save still happen. Other local, possibly-
-/// unpushed service edits (env, build_command, source URLs, …) are always
-/// preserved.
+/// block unchanged rather than aborting the whole pull. It also adopts the live
+/// compute pod via [`apply_live_pod`]. Either way the `deploy_tag` refresh and
+/// the save still happen. Other local, possibly-unpushed service edits (env,
+/// build_command, source URLs, …) are always preserved.
 fn refresh_existing(client: &ApiClient, existing: &PartiriConfig) -> Result<PartiriConfig> {
     let id = existing
         .id
@@ -63,10 +63,43 @@ fn refresh_existing(client: &ApiClient, existing: &PartiriConfig) -> Result<Part
 
     let mut refreshed = existing.clone();
     refreshed.deploy_tag = service.deploy_tag;
+    apply_live_pod(&mut refreshed, service.fk_pod.as_deref());
     let fetched = fetch_service_disk(client, &refreshed.fk_project, id);
     apply_live_disk(&mut refreshed, fetched);
     refreshed.save()?;
     Ok(refreshed)
+}
+
+/// Fold the live compute pod into `config.service.fk_pod`.
+///
+/// The pod size is billed, so the API has to win here: a size changed in the
+/// dashboard that the pull left alone would be silently reverted — and the old
+/// size re-charged — by the next `partiri service push`, which sends the local
+/// service block wholesale. Adopting it and saying so is the only behaviour that
+/// doesn't cost the user money behind their back.
+///
+/// An absent or empty live value leaves the local `fk_pod` untouched, so a
+/// config for a service the API reports no pod for keeps whatever the user set.
+///
+/// Warnings go to stderr and are suppressed in --json mode.
+fn apply_live_pod(config: &mut PartiriConfig, live: Option<&str>) {
+    let Some(live) = live.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if config.service.fk_pod == live {
+        return;
+    }
+    // An empty local value is a config being filled in, not a divergence.
+    if !config.service.fk_pod.is_empty() && !crate::output::ctx().json {
+        eprintln!(
+            "  {} compute pod '{}' adopted from the API, replacing local '{}'; \
+             the next 'partiri service push' would otherwise have reverted it.",
+            "warn:".yellow(),
+            live,
+            config.service.fk_pod,
+        );
+    }
+    config.service.fk_pod = live.to_string();
 }
 
 /// Fold the live volume's disk state into `config.service.disk` without ever
@@ -861,5 +894,80 @@ mod overwrite_guard_tests {
         assert!(existing.is_none());
         assert!(overwrite_guard(true, existing.as_ref(), "svc-1", false).is_err());
         assert!(overwrite_guard(true, existing.as_ref(), "svc-1", true).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod apply_live_pod_tests {
+    use super::*;
+
+    fn cfg(fk_pod: &str) -> PartiriConfig {
+        PartiriConfig {
+            id: Some("svc-1".to_string()),
+            deploy_tag: None,
+            fk_workspace: "ws-1".to_string(),
+            fk_project: "proj-1".to_string(),
+            service: ServiceConfig {
+                name: "svc".to_string(),
+                deploy_type: "webservice".to_string(),
+                runtime: "node".to_string(),
+                root_path: ".".to_string(),
+                repository_url: None,
+                repository_branch: None,
+                registry_url: None,
+                fk_service_secret: None,
+                build_path: None,
+                build_command: None,
+                pre_deploy_command: None,
+                run_command: None,
+                fk_region: "region-1".to_string(),
+                fk_pod: fk_pod.to_string(),
+                health_check_path: None,
+                disk: None,
+                maintenance_mode: false,
+                active: true,
+                env: None,
+            },
+        }
+    }
+
+    #[test]
+    fn adopts_a_diverging_live_pod() {
+        // The whole point of the fix: a pod resized in the dashboard must win,
+        // or the next 'service push' silently reverts it and re-bills the old
+        // size.
+        let mut config = cfg("pod-a");
+        apply_live_pod(&mut config, Some("pod-b"));
+        assert_eq!(config.service.fk_pod, "pod-b");
+    }
+
+    #[test]
+    fn preserves_the_local_pod_when_the_api_reports_none() {
+        let mut config = cfg("pod-a");
+        apply_live_pod(&mut config, None);
+        assert_eq!(config.service.fk_pod, "pod-a");
+    }
+
+    #[test]
+    fn treats_a_blank_live_pod_as_absent() {
+        // An empty string must not blank out a valid local pod — validation
+        // would then reject the config on the next push.
+        let mut config = cfg("pod-a");
+        apply_live_pod(&mut config, Some("   "));
+        assert_eq!(config.service.fk_pod, "pod-a");
+    }
+
+    #[test]
+    fn fills_in_an_empty_local_pod() {
+        let mut config = cfg("");
+        apply_live_pod(&mut config, Some("pod-b"));
+        assert_eq!(config.service.fk_pod, "pod-b");
+    }
+
+    #[test]
+    fn is_a_no_op_when_the_pods_already_agree() {
+        let mut config = cfg("pod-b");
+        apply_live_pod(&mut config, Some("pod-b"));
+        assert_eq!(config.service.fk_pod, "pod-b");
     }
 }

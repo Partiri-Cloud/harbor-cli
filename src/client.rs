@@ -701,9 +701,16 @@ impl ApiClient {
     }
 
     /// `GET /resources/utils/reg` — backend probes the registry, optionally using
-    /// a stored registry secret resolved by `secret_id`.
-    pub fn validate_registry(&self, registry_url: &str, secret_id: Option<&str>) -> Result<bool> {
-        let mut params: Vec<(&str, &str)> = vec![("registry_url", registry_url)];
+    /// a stored registry secret resolved by `secret_id`. `workspace_id` is required
+    /// by the API: it is what the `workspace:r` permission is checked against.
+    pub fn validate_registry(
+        &self,
+        workspace_id: &str,
+        registry_url: &str,
+        secret_id: Option<&str>,
+    ) -> Result<bool> {
+        let mut params: Vec<(&str, &str)> =
+            vec![("workspace", workspace_id), ("registry_url", registry_url)];
         if let Some(id) = secret_id {
             params.push(("id", id));
         }
@@ -712,13 +719,15 @@ impl ApiClient {
 
     /// `GET /resources/utils/git` — backend lists branches via `git ls-remote` (or equivalent),
     /// optionally using a stored repository secret resolved by `secret_id`. A 4xx for a private
-    /// repo without a secret IS the access check.
+    /// repo without a secret IS the access check. `workspace_id` is required by the API: it is
+    /// what the `workspace:r` permission is checked against.
     pub fn load_repository_branches(
         &self,
+        workspace_id: &str,
         url: &str,
         secret_id: Option<&str>,
     ) -> Result<Vec<String>> {
-        let mut params: Vec<(&str, &str)> = vec![("url", url)];
+        let mut params: Vec<(&str, &str)> = vec![("workspace", workspace_id), ("url", url)];
         if let Some(id) = secret_id {
             params.push(("id", id));
         }
@@ -1316,6 +1325,49 @@ mod tests {
         mock.assert();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "api");
+    }
+
+    // ─── source probes ──────────────────────────────────────────────────────
+
+    #[test]
+    fn load_repository_branches_sends_workspace_query_param() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/resources/utils/git")
+                .query_param("workspace", "ws-uuid-123")
+                .query_param("url", "https://github.com/acme/repo.git");
+            then.status(200).json_body(json!(["main", "dev"]));
+        });
+
+        let client = test_client(&server);
+        let result = client
+            .load_repository_branches("ws-uuid-123", "https://github.com/acme/repo.git", None)
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(result, vec!["main", "dev"]);
+    }
+
+    #[test]
+    fn validate_registry_sends_workspace_and_secret_query_params() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/resources/utils/reg")
+                .query_param("workspace", "ws-uuid-123")
+                .query_param("registry_url", "ghcr.io/acme/img:v1")
+                .query_param("id", "sec-uuid-1");
+            then.status(200).json_body(json!(true));
+        });
+
+        let client = test_client(&server);
+        let result = client
+            .validate_registry("ws-uuid-123", "ghcr.io/acme/img:v1", Some("sec-uuid-1"))
+            .unwrap();
+
+        mock.assert();
+        assert!(result);
     }
 
     // ─── list_service_jobs ──────────────────────────────────────────────────

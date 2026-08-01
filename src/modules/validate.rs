@@ -176,7 +176,7 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
         .filter(|s| !s.is_empty())
     {
         let secret_id = config.service.fk_service_secret.as_deref();
-        match client.load_repository_branches(repo_url, secret_id) {
+        match client.load_repository_branches(&config.fk_workspace, repo_url, secret_id) {
             Ok(branches) => {
                 rows.push(CheckRow::ok(
                     "remote.repository_url",
@@ -227,7 +227,7 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
         .filter(|s| !s.is_empty())
     {
         let secret_id = config.service.fk_service_secret.as_deref();
-        match client.validate_registry(registry_url, secret_id) {
+        match client.validate_registry(&config.fk_workspace, registry_url, secret_id) {
             Ok(_) => rows.push(CheckRow::ok("remote.registry_url", "registry reachable")),
             Err(e) => {
                 let hint = if secret_id.is_none() {

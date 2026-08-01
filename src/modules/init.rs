@@ -6,16 +6,17 @@
 //! the wizard and writes a commented scaffold for a human or agent to fill in.
 //! The `prompt_for_*` helpers are also reused by `partiri service link`.
 
+use std::cmp::Ordering;
 use std::path::Path;
 
 use inquire::validator::Validation;
 use inquire::{Confirm, Select, Text};
 use owo_colors::OwoColorize;
 
-use crate::client::ApiClient;
+use crate::client::{ApiClient, Pod, RegionPricing};
 use crate::config::{PartiriConfig, ServiceConfig};
 use crate::error::Result;
-use crate::output::{print_success, print_warning};
+use crate::output::{money_per_month, print_success, print_warning};
 
 // ─── Project detection ────────────────────────────────────────────────────────
 
@@ -313,33 +314,103 @@ pub(crate) fn prompt_for_region(client: Option<&ApiClient>, workspace_id: &str) 
         .map_err(|_| "Cancelled.".into())
 }
 
+/// Monthly price of `pod_id` in the priced region, if the region has a price row
+/// for it. `None` means "no price row", which is a pricing gap — never free.
+fn pod_price(pricing: Option<&RegionPricing>, pod_id: &str) -> Option<f64> {
+    pricing?
+        .pods
+        .iter()
+        .find(|p| p.fk_pod == pod_id)
+        .map(|p| p.price)
+}
+
+/// Build the pod picker's labels and the matching pod list, ordered so the
+/// cheapest pod comes first.
+///
+/// The API returns pods in its own order, which has no relation to price — so
+/// without this the pre-selected option is whichever pod happens to sort first
+/// server-side, and a user pressing Enter can land on the most expensive tier.
+/// Pods with no price row sort last: an absent price is a gap in the pricing
+/// data, not a free tier, and must never be offered as the default.
+///
+/// With no pricing available the API's order is preserved (the sort is stable,
+/// so ties keep it too) and prices are omitted from the labels rather than
+/// rendered as zero. Returns the pods in the same order as the labels so the
+/// caller can map the chosen label back by index.
+pub(crate) fn build_pod_choices(
+    mut pods: Vec<Pod>,
+    pricing: Option<&RegionPricing>,
+) -> (Vec<String>, Vec<Pod>) {
+    if pricing.is_some() {
+        pods.sort_by(
+            |a, b| match (pod_price(pricing, &a.id), pod_price(pricing, &b.id)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+        );
+    }
+
+    let labels: Vec<String> = pods
+        .iter()
+        .map(|p| {
+            let display = p.label.as_deref().unwrap_or(&p.name);
+            let specs = match (p.cpu.as_deref(), p.ram.as_deref()) {
+                (Some(cpu), Some(ram)) => format!(" — {} CPU / {} RAM", cpu, ram),
+                _ => String::new(),
+            };
+            let price = match (pricing, pod_price(pricing, &p.id)) {
+                (Some(_), Some(v)) => format!(" — {}", money_per_month(v)),
+                (Some(_), None) => " — price unavailable".to_string(),
+                (None, _) => String::new(),
+            };
+            format!("{}{}{} ({})", display, specs, price, p.id)
+        })
+        .collect();
+
+    (labels, pods)
+}
+
 /// Prompt for a compute pod UUID within `workspace_id`. With an API client,
 /// offers a selectable list; otherwise falls back to free-text entry.
-pub(crate) fn prompt_for_pod(client: Option<&ApiClient>, workspace_id: &str) -> Result<String> {
+///
+/// `region_id` is what makes prices available — they are per-region, so without
+/// it the list is shown unpriced and unranked. Pass it whenever it is known.
+pub(crate) fn prompt_for_pod(
+    client: Option<&ApiClient>,
+    workspace_id: &str,
+    region_id: Option<&str>,
+) -> Result<String> {
     if let Some(c) = client {
         match c.list_pods(workspace_id) {
             Ok(pods) if !pods.is_empty() => {
-                let labels: Vec<String> = pods
-                    .iter()
-                    .map(|p| {
-                        let display = p.label.as_deref().unwrap_or(&p.name);
-                        match (p.cpu.as_deref(), p.ram.as_deref()) {
-                            (Some(cpu), Some(ram)) => {
-                                format!("{} — {} CPU / {} ({})", display, cpu, ram, p.id)
-                            }
-                            _ => format!("{} ({})", display, p.id),
+                // Best-effort: an unpriced list is worse than a priced one but far
+                // better than failing the wizard, so a pricing error only warns.
+                let pricing = match region_id {
+                    Some(r) => match c.get_pricing(r) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            print_warning(&format!(
+                                "Could not fetch pod pricing: {}. Listing pods without prices.",
+                                e
+                            ));
+                            None
                         }
-                    })
-                    .collect();
+                    },
+                    None => None,
+                };
+
+                let (labels, sorted) = build_pod_choices(pods, pricing.as_ref());
                 let choice = Select::new("Compute pod:", labels.clone())
+                    .with_starting_cursor(0)
                     .prompt()
                     .map_err(|_| "Cancelled.")?;
-                let (_, pod) = labels
-                    .into_iter()
-                    .zip(pods)
-                    .find(|(label, _)| label == &choice)
+                let idx = labels
+                    .iter()
+                    .position(|label| label == &choice)
                     .ok_or("Selected pod not found in list")?;
-                return Ok(pod.id);
+                return Ok(sorted[idx].id.clone());
             }
             Ok(_) => print_warning("No compute pods returned by the API."),
             Err(e) => print_warning(&format!("Could not fetch compute pods: {}", e)),
@@ -562,7 +633,7 @@ pub fn run(args: InitArgs) -> Result<()> {
     let fk_region = prompt_for_region(client.as_ref(), &fk_workspace)?;
 
     // ── Pod (compute) ──
-    let fk_pod = prompt_for_pod(client.as_ref(), &fk_workspace)?;
+    let fk_pod = prompt_for_pod(client.as_ref(), &fk_workspace, Some(&fk_region))?;
 
     // ── Auth token (optional, requires API key) ──
     let source_kind = if is_registry {
@@ -795,4 +866,150 @@ fn write_template() -> Result<()> {
     );
     println!("  Full agent guide: {}.", "'partiri llm guide'".bold());
     Ok(())
+}
+
+#[cfg(test)]
+mod build_pod_choices_tests {
+    use super::*;
+    use crate::client::PodPrice;
+
+    /// A synthetic catalog — deliberately not the production one, down to the
+    /// tier names, specs, and prices. Real pods and prices live in the database
+    /// and change without a release, so pinning them here would both go stale
+    /// and publish a price list. Only the shape matters: the API's order is
+    /// unrelated to price, one tier has no price row, and one tier reports no
+    /// cpu/ram.
+    fn catalog() -> Vec<Pod> {
+        vec![
+            pod("pod-c", "roomy", Some("1600m"), Some("3072Mi")),
+            pod("pod-a", "tiny", Some("250m"), Some("384Mi")),
+            pod("pod-d", "unpriced", Some("3200m"), Some("6144Mi")),
+            pod("pod-b", "middling", Some("800m"), Some("1536Mi")),
+            pod("pod-e", "specless", None, None),
+        ]
+    }
+
+    fn pod(id: &str, name: &str, cpu: Option<&str>, ram: Option<&str>) -> Pod {
+        Pod {
+            id: id.to_string(),
+            name: name.to_string(),
+            label: None,
+            cpu: cpu.map(str::to_string),
+            ram: ram.map(str::to_string),
+        }
+    }
+
+    fn pricing(entries: &[(&str, f64)]) -> RegionPricing {
+        RegionPricing {
+            pods: entries
+                .iter()
+                .map(|(id, price)| PodPrice {
+                    fk_pod: id.to_string(),
+                    price: *price,
+                    per_minute: price / (30.0 * 24.0 * 60.0),
+                })
+                .collect(),
+            volume_price_per_gb: 1.0,
+        }
+    }
+
+    fn full_pricing() -> RegionPricing {
+        // 'pod-d' is intentionally absent: a pod with no price row.
+        pricing(&[
+            ("pod-c", 22.0),
+            ("pod-a", 3.25),
+            ("pod-b", 11.0),
+            ("pod-e", 7.0),
+        ])
+    }
+
+    #[test]
+    fn orders_cheapest_first_so_the_default_is_the_cheapest_pod() {
+        // The bug this guards: the API returns pods in an order unrelated to
+        // price, and the picker pre-selects index 0 — so without the sort a user
+        // pressing Enter lands on whatever tier the server happened to list
+        // first, which in production was the most expensive one.
+        let (_, sorted) = build_pod_choices(catalog(), Some(&full_pricing()));
+        let ids: Vec<&str> = sorted.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["pod-a", "pod-e", "pod-b", "pod-c", "pod-d"]);
+    }
+
+    #[test]
+    fn sorts_unpriced_pods_last() {
+        // A missing price row is a gap in the pricing data, not a free tier — it
+        // must never be the pre-selected default.
+        let (labels, sorted) = build_pod_choices(catalog(), Some(&full_pricing()));
+        assert_eq!(sorted.last().unwrap().id, "pod-d");
+        assert!(
+            labels.last().unwrap().contains("price unavailable"),
+            "{}",
+            labels.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn renders_the_price_and_specs_in_the_label() {
+        let (labels, _) = build_pod_choices(catalog(), Some(&full_pricing()));
+        assert_eq!(
+            labels[0], "tiny — 250m CPU / 384Mi RAM — €3.25/mo (pod-a)",
+            "cheapest pod's label"
+        );
+    }
+
+    #[test]
+    fn omits_specs_when_the_pod_reports_none() {
+        let (labels, sorted) = build_pod_choices(catalog(), Some(&full_pricing()));
+        let idx = sorted.iter().position(|p| p.id == "pod-e").unwrap();
+        assert_eq!(labels[idx], "specless — €7.00/mo (pod-e)");
+    }
+
+    #[test]
+    fn prefers_the_label_over_the_name_when_present() {
+        let mut p = pod("pod-x", "internal-name", Some("500m"), Some("512Mi"));
+        p.label = Some("Friendly".to_string());
+        let (labels, _) = build_pod_choices(vec![p], Some(&pricing(&[("pod-x", 1.0)])));
+        assert!(labels[0].starts_with("Friendly — "), "{}", labels[0]);
+    }
+
+    #[test]
+    fn without_pricing_keeps_api_order_and_prints_no_price() {
+        // Degradation path: pricing is per-region and best-effort. Losing it must
+        // not reorder the list misleadingly, and must never render as €0.00.
+        let (labels, sorted) = build_pod_choices(catalog(), None);
+        let ids: Vec<&str> = sorted.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["pod-c", "pod-a", "pod-d", "pod-b", "pod-e"]);
+        for label in &labels {
+            assert!(!label.contains(crate::output::CURRENCY_SYMBOL), "{}", label);
+            assert!(!label.contains("price unavailable"), "{}", label);
+        }
+    }
+
+    #[test]
+    fn handles_a_catalog_with_no_priced_pods() {
+        let (labels, sorted) = build_pod_choices(catalog(), Some(&pricing(&[])));
+        assert_eq!(sorted.len(), 5, "no pod is dropped");
+        assert!(labels.iter().all(|l| l.contains("price unavailable")));
+    }
+
+    #[test]
+    fn handles_single_pod_and_empty_catalogs() {
+        let one = vec![pod("pod-a", "tiny", Some("500m"), Some("512Mi"))];
+        let (labels, sorted) = build_pod_choices(one, Some(&full_pricing()));
+        assert_eq!(labels.len(), 1);
+        assert_eq!(sorted[0].id, "pod-a");
+
+        let (labels, sorted) = build_pod_choices(vec![], Some(&full_pricing()));
+        assert!(labels.is_empty() && sorted.is_empty());
+    }
+
+    #[test]
+    fn keeps_labels_and_pods_index_aligned() {
+        // The caller maps the chosen label back to a pod by index, so a mismatch
+        // here would deploy the wrong tier.
+        let (labels, sorted) = build_pod_choices(catalog(), Some(&full_pricing()));
+        assert_eq!(labels.len(), sorted.len());
+        for (label, p) in labels.iter().zip(&sorted) {
+            assert!(label.ends_with(&format!("({})", p.id)), "{}", label);
+        }
+    }
 }

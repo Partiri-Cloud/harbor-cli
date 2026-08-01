@@ -164,7 +164,11 @@ fn run_interactive(client: &ApiClient, config: &mut PartiriConfig) -> Result<()>
             .map_err(|_| "Cancelled.")?
     };
     if update_pod {
-        config.service.fk_pod = prompt_for_pod(Some(client), &config.fk_workspace)?;
+        config.service.fk_pod = prompt_for_pod(
+            Some(client),
+            &config.fk_workspace,
+            Some(&config.service.fk_region),
+        )?;
         changed = true;
     }
 

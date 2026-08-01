@@ -301,6 +301,17 @@ pub fn print_info(msg: &str) {
     println!("{} {}", "→".cyan(), msg);
 }
 
+/// The currency every price the CLI prints is denominated in. Partiri bills in
+/// EUR; the pricing endpoint returns bare numbers with no currency field, so the
+/// symbol lives here rather than being spelled out at each call site — a fork
+/// billing in something else changes this one constant.
+pub const CURRENCY_SYMBOL: &str = "€";
+
+/// Render a flat monthly price for display, e.g. `€4.50/mo`.
+pub fn money_per_month(amount: f64) -> String {
+    format!("{}{:.2}/mo", CURRENCY_SYMBOL, amount)
+}
+
 /// Print a warning line to stderr. Suppressed in JSON mode.
 pub fn print_warning(msg: &str) {
     if ctx().json {
