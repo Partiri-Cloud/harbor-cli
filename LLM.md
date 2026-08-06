@@ -85,6 +85,7 @@ Invariants worth knowing up front:
 | Secrets | — | `partiri -j secrets list --workspace <UUID>` |
 | Services | — | `partiri -j service list --project <UUID>` |
 | Storage volumes | — | `partiri -j storage list --project <UUID>` |
+| Databases | — | `partiri -j db list --project <UUID>` |
 
 `partiri llm context` is the single most useful command for any multi-resource decision — it
 fans out the per-workspace requests in parallel and returns a fully nested tree.
@@ -257,6 +258,67 @@ partiri -j -y storage delete <VOLUME_UUID>  # delete (must be detached first)
 `.partiri.jsonc`. `storage detach` requires the service to be paused and have no active job; the
 CLI surfaces the API's 400 with a clear hint rather than checking job state itself.
 
+### Create a managed PostgreSQL database
+
+A database is **not** a `.partiri.jsonc` service. It lives entirely behind `partiri db`, takes
+flags only, and is addressed by UUID. Do not try to `service pull` one — the CLI refuses, because
+`deploy_type: "database"` and `runtime: "psql"` are not valid config values.
+
+```sh
+partiri -j projects list
+partiri -j regions list --workspace <WORKSPACE_UUID>
+partiri -j pods list --workspace <WORKSPACE_UUID> --region <REGION_UUID>
+
+partiri -j db create --project <PROJECT_UUID> --region <REGION_UUID> --pod <POD_UUID> \
+    --name orders-db --db-name appdb --db-user appuser --version 17 --disk 1
+
+partiri -j -y db deploy <DATABASE_UUID>  # 409 = volume still provisioning; wait and retry
+partiri -j db jobs      <DATABASE_UUID>  # poll until the deploy job reports "succeeded"
+partiri -j db show      <DATABASE_UUID>  # host, port, database, user, connection_string
+partiri -j db list      --project <PROJECT_UUID>
+partiri -j -y db pause   <DATABASE_UUID> # hibernate: stops compute, keeps data
+partiri -j -y db unpause <DATABASE_UUID>
+partiri -j -y db delete  <DATABASE_UUID> # IRREVERSIBLE
+```
+
+**Capture the password from the `db create` response.** A generated password appears in the `-j`
+envelope as `password` and nowhere else — ever. The API stores it write-only, no endpoint returns
+it, and there is no rotation. If it is lost, the only remedy is deleting the database and creating
+a new one. Omit `--password-stdin` to have the CLI generate a strong one; there is no `--password`
+flag, since that would leak into shell history and the process list.
+
+If you pass `--password-stdin` instead, `password` comes back `null` (you already have it) and
+`password_generated` is `false`. Piping also makes stdin a non-TTY, which disables every prompt —
+so a `--password-stdin` run must supply **every** value by flag, `--region` and `--pod` included.
+The same holds for any agent or CI invocation, which is why the recipe above passes all of them.
+
+If `db create` errors, check `partiri db list` before retrying: a timeout or an unparseable
+response can arrive after the server already committed. The CLI prints a generated password on that
+error path too, precisely because it may be the only copy that will ever exist.
+
+Field rules, all enforced locally before the API call:
+
+| Field | Rule |
+|---|---|
+| `--name` | Dashboard display name, 1–16 chars, `^[A-Za-z0-9]([A-Za-z0-9 -]*[A-Za-z0-9])?$`. Immutable. |
+| `--db-name`, `--db-user` | `^[a-z_][a-z0-9_]{0,62}$`; `template0`, `template1`, `postgres` reserved. Immutable. |
+| `--version` | `16` or `17`. Immutable. |
+| `--disk` | 1–10 GB, default 1. Create-only — the volume cannot be resized. |
+| password | 12–128 printable-ASCII chars. Write-only, never rotatable. |
+
+Not supported by the platform, so there is no command for any of it: updating a database, killing
+one (`db pause` or `db delete` instead), rotating the password, backups/restore/PITR, replicas, a
+second region, a public endpoint, or any engine other than PostgreSQL.
+
+The connection string is built client-side because the API has no endpoint for it:
+`postgresql://<db_user>@<internal_sd_url>-rw:5432/<db_name>`. The host resolves **only inside the
+cluster**, so a consuming service must also run on Partiri. `connection_string` is `null` until the
+first successful deploy populates `internal_sd_url`. To wire it into an app, put the full URL
+(with the password you captured) into that service's env via `partiri service env --path <file>`.
+
+The API provisions and attaches the database's volume itself. Never run `partiri storage create`
+for a database; `storage` mutations on a database-owned volume are rejected server-side.
+
 ### Set runtime environment variables
 
 Env vars are never stored in `.partiri.jsonc`. Manage them with `partiri service env`:
@@ -350,6 +412,14 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **A service with a disk cannot be multi-region.** The API enforces single-region placement when a persistent volume is attached.
 - **`storage detach` requires the service to be paused.** Pause first with `partiri service pause`, then detach, then optionally delete.
 - **Balance warnings from `validate --remote` are non-blocking.** The `remote.balance` row is a warn, not a fail. The API itself returns 402 when the balance is insufficient — that is the hard backstop.
+- **A managed database's password is shown exactly once, by `db create`.** It is stored write-only, no endpoint returns it, and it cannot be rotated. Read `password` out of the `-j` envelope and persist it immediately; losing it means deleting and recreating the database.
+- **Databases are not `.partiri.jsonc` services.** Use `partiri db`, not `partiri service`. `service pull` refuses a database UUID and the interactive picker hides them, because `deploy_type: "database"` / `runtime: "psql"` are not valid config values.
+- **A database's name, database name, user, version, and disk size are all immutable.** There is no `db update`; the disk cannot be resized either. Get them right at create time.
+- **`db kill` does not exist** — the API rejects `kill` for databases. Use `db pause` (hibernates, keeps data) or `db delete` (destroys everything).
+- **`db delete` is irreversible.** Partiri has no backup, restore, or point-in-time recovery for managed databases.
+- **`db deploy` right after `db create` can return 409.** The storage volume provisions asynchronously; wait a few seconds and retry. The CLI rewrites that 409 into an explicit hint.
+- **Never run `storage create` for a database.** The API provisions and attaches its volume itself, and rejects `storage` mutations on database-owned volumes.
+- **A database has no public endpoint.** `<internal_sd_url>-rw:5432` resolves only inside the cluster, so anything connecting to it must also be deployed on Partiri.
 
 ## 10. Glossary
 
