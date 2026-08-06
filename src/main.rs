@@ -38,8 +38,9 @@ mod modules;
 mod output;
 
 use cli::{
-    AuthCommands, Cli, Commands, LlmCommands, McpCommands, PodCommands, ProjectCommands,
-    RegionCommands, SecretsCommands, ServiceCommands, StorageCommands, WorkspaceCommands,
+    AuthCommands, Cli, Commands, DbCommands, LlmCommands, McpCommands, PodCommands,
+    ProjectCommands, RegionCommands, SecretsCommands, ServiceCommands, StorageCommands,
+    WorkspaceCommands,
 };
 use client::ApiClient;
 use config::PartiriConfig;
@@ -336,6 +337,49 @@ fn run(cli: Cli) -> error::Result<()> {
                 StorageCommands::Detach { id } => modules::storage::run_detach(&client, &id)?,
                 StorageCommands::Delete { id } => modules::storage::run_delete(&client, &id)?,
                 StorageCommands::Create | StorageCommands::Update => unreachable!(),
+            }
+        }
+
+        // A managed database is never described by `.partiri.jsonc`, so every
+        // subcommand here needs only the API client.
+        Commands::Db(cmd) => {
+            let client = ApiClient::new()?;
+            match cmd {
+                DbCommands::Create {
+                    project,
+                    workspace,
+                    name,
+                    db_name,
+                    db_user,
+                    version,
+                    disk,
+                    region,
+                    pod,
+                    password_stdin,
+                } => modules::databases::run_create(
+                    &client,
+                    modules::databases::CreateArgs {
+                        project,
+                        workspace,
+                        name,
+                        db_name,
+                        db_user,
+                        version,
+                        disk,
+                        region,
+                        pod,
+                        password_stdin,
+                    },
+                )?,
+                DbCommands::List { project, workspace } => {
+                    modules::databases::run_list(&client, project, workspace)?
+                }
+                DbCommands::Show { id } => modules::databases::run_show(&client, &id)?,
+                DbCommands::Deploy { id } => modules::databases::run_deploy(&client, &id)?,
+                DbCommands::Pause { id } => modules::databases::run_pause(&client, &id)?,
+                DbCommands::Unpause { id } => modules::databases::run_unpause(&client, &id)?,
+                DbCommands::Jobs { id } => modules::databases::run_jobs(&client, &id)?,
+                DbCommands::Delete { id } => modules::databases::run_delete(&client, &id)?,
             }
         }
     }

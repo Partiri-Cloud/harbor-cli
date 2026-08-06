@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod common;
+pub mod databases;
 pub mod init;
 pub mod jobs;
 pub mod llm;

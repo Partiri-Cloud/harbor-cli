@@ -64,6 +64,9 @@ pub enum Commands {
     /// Manage persistent storage volumes attached to services
     #[command(subcommand)]
     Storage(StorageCommands),
+    /// Manage managed PostgreSQL databases
+    #[command(subcommand, visible_alias = "database")]
+    Db(DbCommands),
     /// Manage workspace secrets (registry and repository credentials)
     #[command(subcommand)]
     Secrets(SecretsCommands),
@@ -355,6 +358,93 @@ pub enum StorageCommands {
     /// Delete a volume (must be detached first)
     Delete {
         /// Volume UUID.
+        #[arg(value_name = "UUID")]
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DbCommands {
+    /// Create a managed PostgreSQL database
+    ///
+    /// A database is never described by `.partiri.jsonc` — every value comes
+    /// from these flags (or an interactive prompt). The password is generated
+    /// unless `--password-stdin` is passed, is shown exactly once, and can
+    /// never be retrieved or rotated afterwards.
+    Create {
+        /// Project UUID. Required if you have multiple projects.
+        #[arg(long, value_name = "UUID")]
+        project: Option<String>,
+        /// Workspace UUID. Scopes the project picker.
+        #[arg(long, value_name = "UUID")]
+        workspace: Option<String>,
+        /// Service name shown in the dashboard (max 16 characters).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// PostgreSQL database name. Lowercase; starts with a letter or underscore.
+        #[arg(long = "db-name", value_name = "NAME")]
+        db_name: Option<String>,
+        /// PostgreSQL role that owns the database. Same naming rules as --db-name.
+        #[arg(long = "db-user", value_name = "USER")]
+        db_user: Option<String>,
+        /// PostgreSQL major version.
+        #[arg(long, value_name = "VER", value_parser = ["16", "17"])]
+        version: Option<String>,
+        /// Disk size in GB (1–10). Cannot be changed after creation.
+        #[arg(long, value_name = "GB")]
+        disk: Option<u32>,
+        /// Region UUID. Prompts when omitted.
+        #[arg(long, value_name = "UUID")]
+        region: Option<String>,
+        /// Compute pod UUID. Prompts (cheapest first) when omitted.
+        #[arg(long, value_name = "UUID")]
+        pod: Option<String>,
+        /// Read the password from stdin (single line, trimmed) instead of generating one.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
+    /// List databases in a project
+    List {
+        /// Project UUID. Required if you have multiple projects.
+        #[arg(long, value_name = "UUID")]
+        project: Option<String>,
+        /// Workspace UUID. Scopes the project picker.
+        #[arg(long, value_name = "UUID")]
+        workspace: Option<String>,
+    },
+    /// Show details and connection info for a database
+    Show {
+        /// Database service UUID.
+        #[arg(value_name = "UUID")]
+        id: String,
+    },
+    /// Trigger a deploy job for a database
+    Deploy {
+        /// Database service UUID.
+        #[arg(value_name = "UUID")]
+        id: String,
+    },
+    /// Pause a database (hibernates the cluster; stops billable compute)
+    Pause {
+        /// Database service UUID.
+        #[arg(value_name = "UUID")]
+        id: String,
+    },
+    /// Resume a paused database
+    Unpause {
+        /// Database service UUID.
+        #[arg(value_name = "UUID")]
+        id: String,
+    },
+    /// List jobs for a database
+    Jobs {
+        /// Database service UUID.
+        #[arg(value_name = "UUID")]
+        id: String,
+    },
+    /// Permanently delete a database and all its data (requires confirmation)
+    Delete {
+        /// Database service UUID.
         #[arg(value_name = "UUID")]
         id: String,
     },

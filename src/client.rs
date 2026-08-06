@@ -45,7 +45,7 @@ pub struct Project {
 }
 
 /// A single environment variable as returned by the API.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ApiEnvVar {
     /// Variable name.
     pub key: String,
@@ -79,8 +79,18 @@ pub struct Service {
     pub deploy_type: String,
     pub runtime: String,
     pub external_sd_url: Option<String>,
-    #[allow(dead_code)]
+    /// Cluster-internal hostname. For a managed database this is the
+    /// CloudNativePG cluster name; the read-write endpoint is `<value>-rw`.
     pub internal_sd_url: Option<String>,
+    // Managed database (only populated when `deploy_type == "database"`)
+    /// Database engine. Always `"postgresql"` — forced server-side.
+    pub db_type: Option<String>,
+    /// PostgreSQL major version (`"16"` or `"17"`).
+    pub db_version: Option<String>,
+    /// Name of the PostgreSQL database created by the bootstrap.
+    pub db_name: Option<String>,
+    /// PostgreSQL role that owns the database.
+    pub db_user: Option<String>,
     // Source
     pub repository_url: Option<String>,
     pub repository_branch: Option<String>,
@@ -409,6 +419,76 @@ struct ServiceBody<'a> {
     service: &'a ServiceConfig,
     fk_project: &'a str,
     fk_workspace: &'a str,
+}
+
+/// One entry of the `replicas` array on a service-create body. A managed
+/// database accepts exactly one, with `is_primary: true` — the API rejects
+/// secondaries outright.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct ReplicaBody {
+    pub fk_region: String,
+    pub is_primary: bool,
+}
+
+/// Request body for `POST /services` when creating a managed database.
+///
+/// A database cannot reuse [`ServiceBody`]: [`ServiceConfig`] has no `db_*`
+/// fields, and a database is never described by `.partiri.jsonc` — it is
+/// created from command-line flags alone.
+///
+/// `runtime` and `db_type` are sent for clarity even though the API overwrites
+/// them server-side (`runtime = 'psql'`, `db_type = 'postgresql'`), as does the
+/// web dashboard. `db_password` is write-only: the API stores it once as a
+/// managed service secret and no endpoint ever returns it. `db_disk_size` is
+/// absent from the published `@partiri-cloud/types` package but is read
+/// defensively off the raw body by the API; it is create-only.
+#[derive(PartialEq, serde::Serialize)]
+pub struct CreateDatabaseBody {
+    pub name: String,
+    pub deploy_type: String,
+    pub runtime: String,
+    pub db_type: String,
+    pub db_version: String,
+    pub db_name: String,
+    pub db_user: String,
+    pub db_password: String,
+    pub db_disk_size: u32,
+    pub fk_project: String,
+    pub fk_region: String,
+    pub fk_pod: String,
+    pub replicas: Vec<ReplicaBody>,
+    pub root_path: String,
+    pub env: Vec<ApiEnvVar>,
+    pub maintenance_mode: bool,
+    pub active: bool,
+}
+
+/// Hand-written so `db_password` can never reach a log, a panic message, or a
+/// `dbg!` left behind in an error path. The password is unrecoverable and
+/// unrotatable, which makes an accidental `{:?}` far more costly than usual —
+/// deriving `Debug` would leave that one keystroke away.
+impl std::fmt::Debug for CreateDatabaseBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateDatabaseBody")
+            .field("name", &self.name)
+            .field("deploy_type", &self.deploy_type)
+            .field("runtime", &self.runtime)
+            .field("db_type", &self.db_type)
+            .field("db_version", &self.db_version)
+            .field("db_name", &self.db_name)
+            .field("db_user", &self.db_user)
+            .field("db_password", &"<redacted>")
+            .field("db_disk_size", &self.db_disk_size)
+            .field("fk_project", &self.fk_project)
+            .field("fk_region", &self.fk_region)
+            .field("fk_pod", &self.fk_pod)
+            .field("replicas", &self.replicas)
+            .field("root_path", &self.root_path)
+            .field("env", &self.env)
+            .field("maintenance_mode", &self.maintenance_mode)
+            .field("active", &self.active)
+            .finish()
+    }
 }
 
 // ─── ApiClient ────────────────────────────────────────────────────────────────
@@ -857,6 +937,36 @@ impl ApiClient {
         self.enqueue_job("kill", id)
     }
 
+    // ─── Databases ────────────────────────────────────────────────────────────
+
+    /// Create a managed PostgreSQL database (`POST /services` with
+    /// `deploy_type: "database"`), returning the created service row.
+    ///
+    /// There is no `/databases` route: the API models a database as a service.
+    /// It also provisions and attaches the storage volume itself, so the caller
+    /// must not touch `/storage/volumes`.
+    pub fn create_database(&self, body: &CreateDatabaseBody) -> Result<Service> {
+        self.post("/services", body)
+    }
+
+    /// Delete a service (`DELETE /services/:id`).
+    ///
+    /// For a database this enqueues a `delete` job rather than a `kill` one (a
+    /// helm uninstall would cascade into the CloudNativePG cluster's PVCs) and
+    /// destroys the data irrecoverably — the platform has no backup or restore.
+    pub fn delete_service(&self, id: &str) -> Result<()> {
+        let spinner = new_spinner();
+        let response = self.send_with_retry(|| {
+            self.agent
+                .delete(&format!("{}/services/{}", self.base_url, id))
+                .set("x-api-key", &self.api_key)
+                .call()
+                .map_err(Box::new)
+        })?;
+        spinner.finish_and_clear();
+        self.handle_response_empty(response)
+    }
+
     // ─── Secrets ─────────────────────────────────────────────────────────────
 
     /// Create a registry secret in a workspace (`POST /workspaces/secrets/registry`).
@@ -1000,6 +1110,160 @@ impl ApiClient {
             &format!("/storage/volumes/{}/retry", volume_id),
             &serde_json::json!({}),
         )
+    }
+}
+
+#[cfg(test)]
+mod database_tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    fn test_client(server: &MockServer) -> ApiClient {
+        ApiClient::for_test(server.base_url())
+    }
+
+    fn sample_body() -> CreateDatabaseBody {
+        CreateDatabaseBody {
+            name: "mydb".to_string(),
+            deploy_type: "database".to_string(),
+            runtime: "psql".to_string(),
+            db_type: "postgresql".to_string(),
+            db_version: "17".to_string(),
+            db_name: "appdb".to_string(),
+            db_user: "appuser".to_string(),
+            db_password: "sup3rSecretPass".to_string(),
+            db_disk_size: 2,
+            fk_project: "proj-1".to_string(),
+            fk_region: "reg-1".to_string(),
+            fk_pod: "pod-1".to_string(),
+            replicas: vec![ReplicaBody {
+                fk_region: "reg-1".to_string(),
+                is_primary: true,
+            }],
+            root_path: String::new(),
+            env: vec![],
+            maintenance_mode: false,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn create_database_posts_full_body_and_parses_response() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/services").json_body(json!({
+                "name": "mydb",
+                "deploy_type": "database",
+                "runtime": "psql",
+                "db_type": "postgresql",
+                "db_version": "17",
+                "db_name": "appdb",
+                "db_user": "appuser",
+                "db_password": "sup3rSecretPass",
+                "db_disk_size": 2,
+                "fk_project": "proj-1",
+                "fk_region": "reg-1",
+                "fk_pod": "pod-1",
+                "replicas": [{ "fk_region": "reg-1", "is_primary": true }],
+                "root_path": "",
+                "env": [],
+                "maintenance_mode": false,
+                "active": true
+            }));
+            then.status(201).json_body(json!({
+                "id": "svc-db-1",
+                "name": "mydb",
+                "deploy_type": "database",
+                "runtime": "psql",
+                "internal_sd_url": "mydb-abc123",
+                "db_type": "postgresql",
+                "db_version": "17",
+                "db_name": "appdb",
+                "db_user": "appuser",
+                "fk_project": "proj-1"
+            }));
+        });
+
+        let svc = test_client(&server)
+            .create_database(&sample_body())
+            .unwrap();
+
+        mock.assert();
+        assert_eq!(svc.id, "svc-db-1");
+        assert_eq!(svc.deploy_type, "database");
+        assert_eq!(svc.db_version.as_deref(), Some("17"));
+        assert_eq!(svc.db_name.as_deref(), Some("appdb"));
+        assert_eq!(svc.db_user.as_deref(), Some("appuser"));
+        assert_eq!(svc.internal_sd_url.as_deref(), Some("mydb-abc123"));
+    }
+
+    #[test]
+    fn create_database_body_never_carries_repo_or_build_fields() {
+        // The API force-clears these server-side, but sending them would be
+        // misleading and could trip the "unknown column" rejection.
+        let json = serde_json::to_string(&sample_body()).unwrap();
+        for field in [
+            "repository_url",
+            "repository_branch",
+            "registry_url",
+            "build_command",
+            "build_path",
+            "run_command",
+            "pre_deploy_command",
+            "health_check_path",
+        ] {
+            assert!(
+                !json.contains(field),
+                "create body must not carry '{field}': {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_deserializes_without_any_db_fields() {
+        // Non-database services come back with the db_* columns absent entirely.
+        let svc: Service = serde_json::from_value(json!({
+            "id": "svc-1",
+            "name": "web",
+            "deploy_type": "webservice",
+            "runtime": "node"
+        }))
+        .expect("a service without db_* fields must still deserialize");
+        assert!(svc.db_type.is_none());
+        assert!(svc.db_version.is_none());
+        assert!(svc.db_name.is_none());
+        assert!(svc.db_user.is_none());
+    }
+
+    #[test]
+    fn delete_service_sends_delete_to_service_path() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("DELETE")
+                .path("/services/svc-db-1")
+                .header("x-api-key", "test-api-key");
+            then.status(200).body("");
+        });
+
+        test_client(&server).delete_service("svc-db-1").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn delete_service_surfaces_api_error_message() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method("DELETE").path("/services/svc-db-1");
+            then.status(409)
+                .json_body(json!({ "message": "Active job already exists for this service" }));
+        });
+
+        let err = test_client(&server).delete_service("svc-db-1").unwrap_err();
+        assert!(
+            err.to_string().contains("Active job already exists"),
+            "{err}"
+        );
     }
 }
 
