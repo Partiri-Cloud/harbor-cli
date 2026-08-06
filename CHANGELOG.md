@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-06
+
+### Added
+
+- `partiri db` (aliased `partiri database`) — manage the platform's new managed
+  PostgreSQL databases: `create`, `list`, `show`, `deploy`, `pause`, `unpause`,
+  `jobs`, and `delete`. A database has no repository, build, or run command, so
+  the family is entirely flag-driven and addressed by UUID; nothing about it is
+  written to `.partiri.jsonc`.
+
+  `db create` generates a strong password by default and prints it once —
+  the API stores it write-only, never returns it, and offers no rotation, so
+  `-j` puts it in the JSON envelope as `password` for scripts and agents. It is
+  also printed when the create request itself fails, since a timeout or an
+  unparseable response can arrive after the server already committed, and that
+  password would otherwise be unrecoverable. Pass `--password-stdin` to supply
+  your own; there is deliberately no `--password` flag, which would leak into
+  shell history and the process list. Every rule the API enforces (identifier
+  pattern and reserved names, PostgreSQL version, disk bounds, password length
+  and character set) is checked locally first, so a bad value fails without a
+  round-trip.
+
+  `deploy`, `pause`, `unpause`, and `delete` confirm before acting, matching the
+  `service` commands; `-y` skips the prompt. `db show` renders the connection
+  string, which the CLI builds client-side
+  because the API exposes no endpoint for it. There is no `db update` or
+  `db kill` subcommand: the API makes every `db_*` field immutable after
+  creation and rejects `kill` for databases.
+
+- `partiri llm explain db …`, a `managed-postgresql-database` entry in
+  `partiri llm examples`, and the `db_*` / `internal_sd_url` fields in
+  `partiri llm context`, so agents driving the CLI can discover and connect to a
+  database without extra calls.
+
+### Changed
+
+- `partiri service pull` now refuses a database UUID and hides databases from
+  its interactive picker. Writing one out produced a `.partiri.jsonc` that every
+  later command rejected, since `deploy_type: "database"` and `runtime: "psql"`
+  are not valid config values.
+
+- `partiri validate` explains what to do when a config declares
+  `deploy_type: "database"` instead of only listing the allowed values.
+
 ## [0.3.2] — 2026-08-01
 
 ### Fixed

@@ -220,6 +220,90 @@ partiri storage detach <VOLUME-UUID>   # service must be paused first
 partiri storage delete <VOLUME-UUID>   # volume must be detached first
 ```
 
+### `partiri db <subcommand>`
+
+Create and operate managed PostgreSQL databases. Aliased as `partiri database`.
+
+A database is not described by `.partiri.jsonc` — it has no repository, build, or
+run command, so every value comes from flags (or an interactive prompt) and every
+subcommand addresses the database by UUID. The API provisions and attaches the
+storage volume itself, so **never** run `partiri storage create` for a database.
+
+| Subcommand                  | Description                                                     |
+|-----------------------------|-----------------------------------------------------------------|
+| `partiri db create`         | Provision a managed PostgreSQL database                         |
+| `partiri db list`           | List the databases in a project                                 |
+| `partiri db show <UUID>`    | Show details and the connection string                          |
+| `partiri db deploy <UUID>`  | Trigger a deploy job                                            |
+| `partiri db pause <UUID>`   | Hibernate the cluster and stop billable compute (data retained) |
+| `partiri db unpause <UUID>` | Resume a paused database                                        |
+| `partiri db jobs <UUID>`    | List the database's jobs                                        |
+| `partiri db delete <UUID>`  | Permanently delete the database and all of its data             |
+
+**`partiri db create`** flags:
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--project <UUID>` | No | Project UUID (prompted if omitted) |
+| `--workspace <UUID>` | No | Workspace UUID — scopes the project picker |
+| `--name <NAME>` | No | Dashboard display name, max 16 chars (prompted if omitted) |
+| `--db-name <NAME>` | No | PostgreSQL database name (prompted if omitted) |
+| `--db-user <USER>` | No | PostgreSQL role that owns the database (prompted if omitted) |
+| `--version <16\|17>` | No | PostgreSQL major version (prompted if omitted) |
+| `--disk <GB>` | No | Disk size, 1–10 GB (default 1) |
+| `--region <UUID>` | No | Region UUID (prompted if omitted) |
+| `--pod <UUID>` | No | Compute pod UUID (prompted cheapest-first if omitted) |
+| `--password-stdin` | No | Read the password from stdin instead of generating one |
+
+```bash
+# Generate the password (recommended) — it is printed once and never again.
+# Any flag you omit is prompted for, so this is fine at a terminal:
+partiri db create --project <PROJECT-UUID> --name orders-db \
+  --db-name appdb --db-user appuser --version 17 --disk 1
+
+partiri db deploy <DATABASE-UUID>     # may 409 briefly while the volume attaches
+partiri db jobs   <DATABASE-UUID>     # poll until the deploy job succeeds
+partiri db show   <DATABASE-UUID>     # host, port, database, user, connection string
+```
+
+To supply your own password, pipe it in — this keeps it out of your shell history
+and out of the process list (there is deliberately no `--password` flag):
+
+```bash
+printf '%s' "$MY_PASSWORD" | partiri db create --password-stdin \
+  --project <PROJECT-UUID> --region <REGION-UUID> --pod <POD-UUID> \
+  --name orders-db --db-name appdb --db-user appuser --version 17 --disk 1
+```
+
+Note that piping makes stdin a non-TTY, which disables **all** prompts — so a
+`--password-stdin` invocation must supply every value by flag, including
+`--region` and `--pod`. The same applies to any scripted or CI run. Use
+`partiri regions list` and `partiri pods list` to find those UUIDs.
+
+`deploy`, `pause`, `unpause`, and `delete` each confirm before acting — pass `-y`
+to skip the prompt in scripts:
+
+```bash
+partiri -y db deploy <DATABASE-UUID>
+```
+
+#### Things the platform does not support
+
+- **No password retrieval or rotation.** The password is stored write-only; no
+  endpoint ever returns it. `db create` prints it exactly once (and puts it in
+  the `-j` JSON envelope as `password`). Losing it means recreating the database.
+- **No `db update`.** The display name, database name, user, PostgreSQL version,
+  and disk size are all fixed at creation time.
+- **No `db kill`.** Use `db pause` to stop compute, or `db delete` to destroy it.
+- **No backups, restore, or point-in-time recovery.** `db delete` is irreversible.
+- **No public endpoint.** The host (`<internal-name>-rw`, port 5432) resolves
+  only from inside the cluster, so a consuming service must run on Partiri too.
+- **Single region, no replicas**, and PostgreSQL is the only engine.
+
+Naming rules mirror PostgreSQL's own: `--db-name` and `--db-user` must match
+`^[a-z_][a-z0-9_]{0,62}$`, and `template0`, `template1`, and `postgres` are
+reserved. The CLI checks all of this locally before calling the API.
+
 ### Discovery
 
 These commands list resources by UUID — useful for filling in a `.partiri.jsonc` by hand:

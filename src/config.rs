@@ -521,10 +521,20 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
         svc.name.len() <= MAX_NAME_LEN,
         "Service name must be 16 characters or fewer",
     );
+    // A managed database is a service with deploy_type "database" on the API
+    // side, but it is provisioned entirely through `partiri db` and has none of
+    // the fields below (source, build, run command). Point there rather than
+    // leaving the user to guess from the generic allowed-values list.
     check(
         "deploy_type",
         DEPLOY_TYPES.contains(&svc.deploy_type.as_str()),
-        &format!("Must be: {}", DEPLOY_TYPES.join(" | ")),
+        &if svc.deploy_type == "database" {
+            "Managed databases are not described by this file — create one with \
+             'partiri db create' and inspect it with 'partiri db show <UUID>'"
+                .to_string()
+        } else {
+            format!("Must be: {}", DEPLOY_TYPES.join(" | "))
+        },
     );
     check(
         "runtime",
@@ -724,6 +734,20 @@ mod tests {
         c.service.deploy_type = "cronjob".to_string();
         let r = validate_config(&c);
         assert!(!r.iter().find(|r| r.field == "deploy_type").unwrap().ok);
+    }
+
+    #[test]
+    fn database_deploy_type_fails_and_points_at_the_db_commands() {
+        let mut c = valid_webservice();
+        c.service.deploy_type = "database".to_string();
+        let r = validate_config(&c);
+        let row = r.iter().find(|r| r.field == "deploy_type").unwrap();
+        assert!(!row.ok);
+        assert!(
+            row.message.contains("partiri db create"),
+            "the database message must point at the db commands: {}",
+            row.message
+        );
     }
 
     #[test]

@@ -176,6 +176,7 @@ pub fn run_by_id(client: &ApiClient, service_id: &str) -> Result<()> {
     overwrite_guard(path_exists, existing.as_ref(), service_id, ctx().yes)?;
 
     let service = client.read_service(service_id)?;
+    reject_database(&service)?;
     let fk_workspace = service.fk_workspace.clone().unwrap_or_default();
     let fk_project = service.fk_project.clone().unwrap_or_default();
     let mut config = map_to_config(service, service_id.to_string(), fk_workspace, fk_project)?;
@@ -340,7 +341,14 @@ pub fn run(client: &ApiClient) -> Result<()> {
     let project_id = proj.id;
 
     // ── Step 3: select service ────────────────────────────────────────────────
-    let services = client.list_services(&project_id, 50)?;
+    // Managed databases are filtered out: they are not describable by
+    // `.partiri.jsonc` (see `reject_database`), so offering one here would only
+    // lead to an error after three prompts.
+    let services: Vec<_> = client
+        .list_services(&project_id, 50)?
+        .into_iter()
+        .filter(|s| !crate::modules::databases::is_database(s))
+        .collect();
     if services.is_empty() {
         return Err("No services found in the selected project.".into());
     }
@@ -375,6 +383,35 @@ pub fn run(client: &ApiClient) -> Result<()> {
     print_success(&format!("{} saved.", crate::config::config_display()));
 
     Ok(())
+}
+
+/// Refuse to pull a managed database into `.partiri.jsonc`.
+///
+/// A database has no repository, build, or run command, and its `deploy_type`
+/// (`database`) and `runtime` (`psql`) are not accepted by
+/// [`validate_config`](crate::config::validate_config) — so writing one out
+/// would produce a config file that every later command rejects. Its disk is
+/// managed by the API too, which the `storage` commands cannot touch.
+pub(crate) fn reject_database(svc: &Service) -> Result<()> {
+    if !crate::modules::databases::is_database(svc) {
+        return Ok(());
+    }
+    Err(Box::new(
+        CliError::new(
+            "validation",
+            format!(
+                "Service {} is a managed database and cannot be described by {}.",
+                svc.id,
+                crate::config::config_display(),
+            ),
+        )
+        .with_hint(format!(
+            "Use 'partiri db show {}' to inspect it, or 'partiri db --help' for the \
+             full database command set.",
+            svc.id,
+        ))
+        .enriched(),
+    ))
 }
 
 /// Treat an empty string from the API as an absent value. The DB stores `''`
@@ -450,6 +487,48 @@ mod fetch_service_disk_tests {
 
     fn client_for(server: &MockServer) -> ApiClient {
         ApiClient::for_test(server.base_url())
+    }
+
+    // ─── reject_database ──────────────────────────────────────────────────────
+
+    #[test]
+    fn reject_database_allows_a_normal_service() {
+        let svc: crate::client::Service = serde_json::from_value(json!({
+            "id": "svc-1", "name": "web",
+            "deploy_type": "webservice", "runtime": "node"
+        }))
+        .unwrap();
+        assert!(reject_database(&svc).is_ok());
+    }
+
+    #[test]
+    fn reject_database_refuses_a_database_and_points_at_db_show() {
+        let svc: crate::client::Service = serde_json::from_value(json!({
+            "id": "svc-db-1", "name": "mydb",
+            "deploy_type": "database", "runtime": "psql"
+        }))
+        .unwrap();
+        let err = reject_database(&svc).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("managed database"), "{text}");
+        assert!(text.contains("partiri db show svc-db-1"), "{text}");
+    }
+
+    #[test]
+    fn run_by_id_refuses_to_pull_a_database() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/services/svc-db-1");
+            then.status(200).json_body(json!({
+                "id": "svc-db-1", "name": "mydb",
+                "deploy_type": "database", "runtime": "psql",
+                "fk_project": "proj-1", "fk_workspace": "ws-1"
+            }));
+        });
+
+        // No config file is written: the guard fires before `map_to_config`.
+        let err = run_by_id(&client_for(&server), "svc-db-1").unwrap_err();
+        assert!(err.to_string().contains("managed database"), "{err}");
     }
 
     #[test]
@@ -632,6 +711,10 @@ mod tests {
             runtime: "node".to_string(),
             external_sd_url: None,
             internal_sd_url: None,
+            db_type: None,
+            db_version: None,
+            db_name: None,
+            db_user: None,
             repository_url: Some("https://github.com/org/repo".to_string()),
             repository_branch: Some("main".to_string()),
             registry_url: None,
