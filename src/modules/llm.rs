@@ -372,6 +372,37 @@ pub fn run_examples() -> Result<()> {
                 "partiri -j -y service create",
                 "partiri -j -y service deploy",
             ]
+        },
+        {
+            "name": "managed-postgresql-database",
+            "description": "Managed PostgreSQL database. Nothing about a database lives in .partiri.jsonc — the 'db' commands take flags and UUIDs only. The API provisions and attaches the storage volume itself; never run 'storage create' for a database.",
+            "note": "The password is returned ONLY by 'db create' (as `password` in the -j envelope). It is stored write-only, is never returned again, and cannot be rotated — capture it immediately. Deleting a database is irreversible: there is no backup or restore.",
+            "constraints": {
+                "versions": ["16", "17"],
+                "db_name_and_db_user": "^[a-z_][a-z0-9_]{0,62}$; 'template0', 'template1', 'postgres' are reserved",
+                "disk_gb": "1–10, create-only (cannot be resized)",
+                "immutable_after_create": ["name", "db_name", "db_user", "version", "disk"],
+                "unsupported": ["update", "kill", "password rotation", "backups", "replicas", "public ingress"]
+            },
+            "commands": [
+                "# Discover where to put it:",
+                "partiri -j projects list",
+                "partiri -j pods list --workspace <WORKSPACE_UUID> --region <REGION_UUID>",
+                "# Create — read `password` out of this response and store it now:",
+                "partiri -j db create --project <PROJECT_UUID> --region <REGION_UUID> --pod <POD_UUID> \\",
+                "    --name orders-db --db-name appdb --db-user appuser --version 17 --disk 1",
+                "# Deploy. A 409 here means the volume is still provisioning — wait and retry.",
+                "partiri -j -y db deploy <DATABASE_UUID>",
+                "partiri -j db jobs <DATABASE_UUID>",
+                "# Inspect (connection string is built client-side; password never included):",
+                "partiri -j db show <DATABASE_UUID>",
+                "partiri -j db list --project <PROJECT_UUID>",
+                "# Stop billable compute without losing data:",
+                "partiri -j -y db pause <DATABASE_UUID>",
+                "partiri -j -y db unpause <DATABASE_UUID>",
+                "# Irreversible:",
+                "partiri -j -y db delete <DATABASE_UUID>",
+            ]
         }
     ]);
     if ctx().json {
@@ -620,9 +651,46 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
         "service token" => vec![
             "Lists registry secrets when registry_url is set, otherwise repository secrets.",
         ],
+        "db" => vec![
+            "A managed database is a service with deploy_type 'database' on the API, but it is NOT describable by .partiri.jsonc — every 'db' command takes flags and UUIDs only.",
+            "There is no 'db update': name, db_name, db_user, and the PostgreSQL version are all immutable after creation, the password cannot be rotated, and the disk cannot be resized.",
+            "There is no 'db kill' — the API rejects kill for databases. Use 'db pause' to stop billable compute, or 'db delete' to destroy it.",
+            "PostgreSQL only; versions 16 and 17. A database is single-region and has no replicas.",
+        ],
+        "db create" => vec![
+            "The password is printed exactly once and stored write-only server-side. No endpoint ever returns it and it cannot be rotated — capture it from the create response or you will have to delete and recreate the database.",
+            "With -j a GENERATED password is in the JSON envelope as `password` (and `password_generated` is true); the `connection_string` field omits it by design.",
+            "Omit --password-stdin to have a strong password generated. There is deliberately no --password flag (it would leak into shell history and the process list). With --password-stdin the envelope's `password` is null — you already have it.",
+            "--password-stdin makes stdin a non-TTY, which disables every prompt: that invocation must pass EVERY value by flag, including --region and --pod. The same applies to any agent/CI run.",
+            "If create errors, run 'db list' before retrying — a timeout or unparseable response can arrive after the server already created the database. A generated password is printed on that error path too.",
+            "--db-name and --db-user must match PostgreSQL's unquoted-identifier rule: ^[a-z_][a-z0-9_]{0,62}$. 'template0', 'template1', and 'postgres' are reserved.",
+            "--name is the dashboard display name (≤16 chars), NOT the PostgreSQL database name. Both are immutable afterwards.",
+            "--disk is 1–10 GB and create-only; the volume cannot be resized later. The API provisions and attaches it — never call 'partiri storage create' for a database.",
+            "Creating a database charges the pod tier plus the disk against the workspace balance; a 402 means insufficient balance.",
+        ],
+        "db deploy" => vec![
+            "Destructive operation — pass -y to skip the confirmation in scripts.",
+            "Deploying immediately after create can 409: the storage volume provisions asynchronously. Wait a few seconds and retry.",
+            "The database is only reachable from inside the cluster — it gets no ingress and no public URL.",
+            "Provisioning the CloudNativePG cluster typically takes 2–11 minutes; poll with 'partiri db jobs <UUID>'.",
+        ],
+        "db pause" => vec![
+            "Destructive operation — pass -y to skip the confirmation in scripts.",
+            "Pausing hibernates the cluster and stops billable compute; the data is retained. Resume with 'db unpause'.",
+        ],
+        "db delete" => vec![
+            "Destructive operation — pass -y to skip the confirmation in scripts.",
+            "IRREVERSIBLE: all data is destroyed. Partiri has no backup, restore, or point-in-time recovery for managed databases.",
+        ],
+        "db show" => vec![
+            "Prints the connection string built client-side; the API exposes no connection-string or credential endpoint.",
+            "The host is <internal_sd_url>-rw on port 5432 and resolves only inside the cluster.",
+            "`connection_string` is null until the first deploy hydrates internal_sd_url.",
+        ],
         "llm context" => vec![
             "One call returns workspaces + their projects/regions/pods/secrets/services.",
             "Pass --workspace <UUID> to scope to one workspace and reduce work.",
+            "Databases appear in the `services` array with deploy_type 'database' and their db_* fields.",
         ],
         _ => vec![],
     }
@@ -845,6 +913,9 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
         for p in &projects {
             if let Ok(svcs) = client.list_services(&p.id, 50) {
                 for s in svcs {
+                    // db_* / internal_sd_url are only populated for managed
+                    // databases (deploy_type "database"); they let an agent
+                    // build a connection string without a follow-up call.
                     services_per_project.push(json!({
                         "id": s.id,
                         "name": s.name,
@@ -853,6 +924,11 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
                         "fk_pod": s.fk_pod,
                         "deploy_type": s.deploy_type,
                         "runtime": s.runtime,
+                        "db_type": s.db_type,
+                        "db_version": s.db_version,
+                        "db_name": s.db_name,
+                        "db_user": s.db_user,
+                        "internal_sd_url": s.internal_sd_url,
                     }));
                 }
             }
