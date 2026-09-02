@@ -1,6 +1,6 @@
 {
   "name": "@partiri/cli-linux-arm64",
-  "version": "0.2.7",
+  "version": "0.5.0",
   "description": "Partiri CLI binary for Linux arm64",
   "license": "MIT",
   "os": [

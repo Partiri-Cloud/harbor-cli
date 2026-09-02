@@ -72,6 +72,11 @@ Invariants worth knowing up front:
 - Private repo/registry sources require `fk_service_secret` (see §5).
 - `disk` is optional and pins the service to a single region (see §5).
 - Env vars are never stored in this file — manage them with `partiri service env`.
+- `deploy_type: "cronjob"` requires `cronjob_active_deadline_seconds` (1–3600)
+  and either `run_command` or `registry_url`.
+- `scheduler` is the cronjob discriminator — present → recurring CronJob, absent
+  → one-shot Job — and is only valid on `deploy_type: "cronjob"`. Runs must be at
+  least 5 minutes apart.
 
 ## 4. Discovery commands
 
@@ -319,6 +324,47 @@ first successful deploy populates `internal_sd_url`. To wire it into an app, put
 The API provisions and attaches the database's volume itself. Never run `partiri storage create`
 for a database; `storage` mutations on a database-owned volume are rejected server-side.
 
+### Run a scheduled job
+
+A batch workload **is** a `.partiri.jsonc` service — same file, same
+`create` / `push` / `deploy` commands. There is no separate command family for it.
+
+`scheduler` is the discriminator: set it for a recurring Kubernetes CronJob, omit it and the
+identical config is a one-shot Job that runs once per deploy. Either way
+`cronjob_active_deadline_seconds` is required.
+
+```sh
+partiri llm template --deploy-type cronjob --runtime node > .partiri.jsonc
+# fill in the UUIDs, then set at least:
+#   "deploy_type": "cronjob"
+#   "run_command": "node job.js"                 # or registry_url for an image
+#   "scheduler": "0 3 * * *"                     # omit entirely for a one-shot Job
+#   "cronjob_active_deadline_seconds": 900       # required, 1-3600
+partiri -j validate
+partiri -j -y service create      # returns max_cost_per_run_eur, NOT monthly_cost_eur
+partiri -j -y service deploy
+partiri -j service status
+```
+
+Constraints the API enforces, all of them pre-checked by `partiri validate`:
+
+| Rule | Detail |
+|---|---|
+| Minimum interval | Runs must be ≥ 5 minutes apart. `* * * * *` and `*/4 * * * *` are rejected. |
+| Deadline | `cronjob_active_deadline_seconds` required, 1–3600. It sizes the per-run balance pre-authorization. |
+| Command | Needs `run_command` (repository source) or `registry_url` (image). |
+| Replicas | Always 1 — a cronjob is never scaled out. |
+| Concurrency | `cronjob_concurrency_policy` ∈ `Allow` \| `Forbid` \| `Replace`. |
+| Timezone | UTC unless `cronjob_time_zone` is set to an IANA zone. |
+
+Pause a schedule without deleting the service by setting `"cronjob_suspend": true` and
+running `partiri -j -y service push`.
+
+The local schedule check expands the minute field and takes the tightest gap between fires,
+counting the wrap into the next hour only when the hour field lets two consecutive hours
+fire. A field it cannot expand is passed through for the API's real cron parser to judge —
+so `validate` passing is not a guarantee the schedule is accepted.
+
 ### Set runtime environment variables
 
 Env vars are never stored in `.partiri.jsonc`. Manage them with `partiri service env`:
@@ -350,13 +396,19 @@ partiri service env --path .env.partiri      # full-replace upload
 
 | Command | What is shown |
 |---|---|
-| `partiri service create` | Estimated monthly cost (pod + disk) for the new service |
+| `partiri service create` | Estimated monthly cost (pod + disk) for the new service — except a cronjob, which is quoted per run (below) |
 | `partiri service push` | Signed monthly cost-delta: desired cost − current cost (e.g. `+€5.0000` or `-€2.0000`) |
 | `partiri pods list --region <UUID>` | Monthly price column (`€/month`) per pod |
 | `partiri llm context` | `price_eur_month` per pod and `volume_price_per_gb` for the workspace; `balance_eur` for each workspace |
 
 All amounts are in EUR. Cost estimates are non-fatal: if pricing is unavailable for a region the
 field is `null` and the command still succeeds.
+
+**A cronjob is not billed monthly.** It is metered per run on actual duration, so
+`service create` returns `max_cost_per_run_eur` — the ceiling one run can reach at the
+configured `cronjob_active_deadline_seconds` — and leaves `monthly_cost_eur` null. Do not
+multiply it out as a monthly figure; the real spend depends on how long runs actually take
+and how often the schedule fires.
 
 ### Balance preflight
 
@@ -420,6 +472,11 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **`db deploy` right after `db create` can return 409.** The storage volume provisions asynchronously; wait a few seconds and retry. The CLI rewrites that 409 into an explicit hint.
 - **Never run `storage create` for a database.** The API provisions and attaches its volume itself, and rejects `storage` mutations on database-owned volumes.
 - **A database has no public endpoint.** `<internal_sd_url>-rw:5432` resolves only inside the cluster, so anything connecting to it must also be deployed on Partiri.
+- **Cron fields on a non-cronjob service are silently ignored by the API.** That reads as "it worked" right up until the schedule never fires, so `validate` fails locally when `scheduler` is set on any other `deploy_type`.
+- **`cronjob_active_deadline_seconds` is required for every cronjob**, recurring or one-shot, and capped at 3600. It is the kill-timeout for a single run and the figure the per-run balance pre-authorization is sized against — not an optional tuning knob.
+- **Cron runs must be at least 5 minutes apart.** `* * * * *` is rejected. `validate` catches the common shapes locally, but the API's cron parser is authoritative: a minute field the CLI cannot expand is passed through, so a local pass is not a guarantee.
+- **A cronjob is billed per run, not per month.** `service create` returns `max_cost_per_run_eur` and leaves `monthly_cost_eur` null. Multiplying the pod's monthly price is the wrong model.
+- **A cronjob always runs one replica** and has no inbound network, so `health_check_path` does nothing.
 
 ## 10. Glossary
 
@@ -428,5 +485,6 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **Service** — the deployable unit. One service per `.partiri.jsonc` per directory.
 - **Region** — geographic location. Pods live in regions.
 - **Pod** — a sized compute slot (CPU + RAM + replicas). Pick a pod that matches your service's needs.
+- **Cronjob** — `deploy_type: "cronjob"`: a batch workload billed per run on actual duration. With `scheduler` set it is a recurring Kubernetes CronJob; without one it is a one-shot Job that runs once per deploy. Both need `cronjob_active_deadline_seconds`.
 - **deploy_tag** — the immutable tag of the most recent successful deploy. Used to fetch logs/metrics for that exact build.
 - **fk_*** — foreign-key fields in `.partiri.jsonc` pointing at other resources by UUID.

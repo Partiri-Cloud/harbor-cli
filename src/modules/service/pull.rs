@@ -464,6 +464,25 @@ pub(crate) fn map_to_config(
                 .fk_pod
                 .filter(|s| !s.is_empty())
                 .ok_or("Pulled service is missing fk_pod")?,
+
+            // Cron fields round-trip verbatim. Dropping them would write a
+            // config declaring `deploy_type: "cronjob"` with no schedule and no
+            // deadline — which `partiri validate` rejects, and which `push`
+            // would then send back as a service that never fires. The string
+            // fields go through `non_empty` so the API's empty strings become
+            // absent keys rather than values that fail validation.
+            scheduler: non_empty(svc.scheduler),
+            cronjob_time_zone: non_empty(svc.cronjob_time_zone),
+            cronjob_active_deadline_seconds: svc.cronjob_active_deadline_seconds,
+            cronjob_backoff_limit: svc.cronjob_backoff_limit,
+            cronjob_ttl_seconds_after_finished: svc.cronjob_ttl_seconds_after_finished,
+            cronjob_concurrency_policy: non_empty(svc.cronjob_concurrency_policy),
+            cronjob_starting_deadline_seconds: svc.cronjob_starting_deadline_seconds,
+            cronjob_successful_jobs_history_limit: svc.cronjob_successful_jobs_history_limit,
+            cronjob_failed_jobs_history_limit: svc.cronjob_failed_jobs_history_limit,
+            cronjob_suspend: svc.cronjob_suspend,
+            cronjob_command: svc.cronjob_command.filter(|c| !c.is_empty()),
+
             health_check_path: non_empty(svc.health_check_path),
             // The volume is a separate resource, not a field on the service, so
             // it is filled in by the caller via `fetch_service_disk` after the
@@ -474,6 +493,9 @@ pub(crate) fn map_to_config(
             // env is never persisted to .partiri.jsonc; manage with
             // `partiri service env --path <.env>`.
             env: None,
+            // Deliberately exhaustive, no `..Default::default()`: a field added
+            // to ServiceConfig must break this build rather than silently pull
+            // back as None, which is exactly how the cron fields went missing.
         },
     })
 }
@@ -607,6 +629,7 @@ mod apply_live_disk_tests {
                 maintenance_mode: false,
                 active: true,
                 env: None,
+                ..Default::default()
             },
         }
     }
@@ -732,6 +755,17 @@ mod tests {
             fk_pod: Some("pod-uuid".to_string()),
             fk_project: Some("proj-1".to_string()),
             fk_workspace: Some("ws-1".to_string()),
+            scheduler: None,
+            cronjob_time_zone: None,
+            cronjob_active_deadline_seconds: None,
+            cronjob_backoff_limit: None,
+            cronjob_ttl_seconds_after_finished: None,
+            cronjob_concurrency_policy: None,
+            cronjob_starting_deadline_seconds: None,
+            cronjob_successful_jobs_history_limit: None,
+            cronjob_failed_jobs_history_limit: None,
+            cronjob_suspend: None,
+            cronjob_command: None,
             health_check_path: None,
             maintenance_mode: Some(false),
             active: Some(true),
@@ -946,6 +980,121 @@ mod tests {
         );
     }
 
+    /// Regression: `client::Service` did not deserialize the cron fields, so
+    /// `map_to_config` filled them from `Default` and a pulled cronjob lost its
+    /// entire schedule. The written config then failed `partiri validate` on a
+    /// missing deadline, and pushing it back sent a job that never fires.
+    /// Payload mirrors a live `GET /services/{id}` for a recurring cronjob.
+    #[test]
+    fn map_to_config_round_trips_a_cronjob() {
+        let svc: Service = serde_json::from_value(serde_json::json!({
+            "id": "svc-cron", "name": "nightly",
+            "fk_project": "proj-1", "fk_workspace": "ws-1",
+            "deploy_type": "cronjob", "runtime": "node",
+            "repository_url": "https://github.com/org/repo",
+            "repository_branch": "main",
+            "root_path": ".", "build_command": "npm ci",
+            "run_command": "node job.js",
+            "fk_pod": "pod-uuid",
+            "scheduler": "0 3 * * *",
+            "cronjob_time_zone": "Europe/Lisbon",
+            "cronjob_active_deadline_seconds": 900,
+            "cronjob_backoff_limit": 2,
+            "cronjob_ttl_seconds_after_finished": 3600,
+            "cronjob_concurrency_policy": "Forbid",
+            "cronjob_starting_deadline_seconds": 120,
+            "cronjob_successful_jobs_history_limit": 3,
+            "cronjob_failed_jobs_history_limit": 1,
+            "cronjob_suspend": false,
+            "cronjob_command": ["node", "job.js"],
+            "maintenance_mode": false, "active": true,
+            "replicas": [{
+                "id": "replica-uuid", "fk_region": "region-uuid", "is_primary": true
+            }]
+        }))
+        .unwrap();
+
+        let config = map_to_config(
+            svc,
+            "svc-cron".to_string(),
+            "ws-1".to_string(),
+            "proj-1".to_string(),
+        )
+        .unwrap();
+
+        let s = &config.service;
+        assert_eq!(s.scheduler.as_deref(), Some("0 3 * * *"));
+        assert_eq!(s.cronjob_time_zone.as_deref(), Some("Europe/Lisbon"));
+        assert_eq!(s.cronjob_active_deadline_seconds, Some(900));
+        assert_eq!(s.cronjob_backoff_limit, Some(2));
+        assert_eq!(s.cronjob_ttl_seconds_after_finished, Some(3600));
+        assert_eq!(s.cronjob_concurrency_policy.as_deref(), Some("Forbid"));
+        assert_eq!(s.cronjob_starting_deadline_seconds, Some(120));
+        assert_eq!(s.cronjob_successful_jobs_history_limit, Some(3));
+        assert_eq!(s.cronjob_failed_jobs_history_limit, Some(1));
+        assert_eq!(s.cronjob_suspend, Some(false));
+        assert_eq!(
+            s.cronjob_command,
+            Some(vec!["node".to_string(), "job.js".to_string()])
+        );
+
+        // The whole point of the pull: the file it writes must be one the CLI
+        // will accept back, and it must still describe the same schedule.
+        let jsonc = config.to_jsonc_string().unwrap();
+        let reparsed: crate::config::PartiriConfig = json5::from_str(&jsonc).unwrap();
+        assert_eq!(reparsed.service.scheduler.as_deref(), Some("0 3 * * *"));
+        assert_eq!(reparsed.service.cronjob_active_deadline_seconds, Some(900));
+
+        let failures: Vec<_> = crate::config::validate_config(&reparsed)
+            .into_iter()
+            .filter(|r| !r.ok)
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "pulled cronjob must validate: {failures:?}"
+        );
+    }
+
+    /// A one-shot Job has no schedule, and the API returns the cron columns as
+    /// SQL NULL. Those must stay absent rather than becoming empty keys.
+    #[test]
+    fn map_to_config_one_shot_job_keeps_cron_fields_absent() {
+        let svc: Service = serde_json::from_value(serde_json::json!({
+            "id": "svc-once", "name": "once",
+            "fk_project": "proj-1", "fk_workspace": "ws-1",
+            "deploy_type": "cronjob", "runtime": "node",
+            "repository_url": "https://github.com/org/repo",
+            "repository_branch": "main",
+            "root_path": ".", "build_command": "npm ci",
+            "run_command": "node job.js",
+            "fk_pod": "pod-uuid",
+            "scheduler": null,
+            "cronjob_time_zone": "",
+            "cronjob_concurrency_policy": "",
+            "cronjob_active_deadline_seconds": 300,
+            "cronjob_command": [],
+            "maintenance_mode": false, "active": true,
+            "replicas": [{
+                "id": "replica-uuid", "fk_region": "region-uuid", "is_primary": true
+            }]
+        }))
+        .unwrap();
+
+        let config = map_to_config(
+            svc,
+            "svc-once".to_string(),
+            "ws-1".to_string(),
+            "proj-1".to_string(),
+        )
+        .unwrap();
+
+        assert!(config.service.scheduler.is_none());
+        assert!(config.service.cronjob_time_zone.is_none());
+        assert!(config.service.cronjob_concurrency_policy.is_none());
+        assert!(config.service.cronjob_command.is_none());
+        assert_eq!(config.service.cronjob_active_deadline_seconds, Some(300));
+    }
+
     #[test]
     fn map_to_config_empty_fk_pod_returns_error() {
         let mut svc = make_service();
@@ -990,6 +1139,7 @@ mod overwrite_guard_tests {
                 maintenance_mode: false,
                 active: true,
                 env: None,
+                ..Default::default()
             },
         }
     }
@@ -1073,6 +1223,7 @@ mod apply_live_pod_tests {
                 maintenance_mode: false,
                 active: true,
                 env: None,
+                ..Default::default()
             },
         }
     }

@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-02
+
+### Added
+
+- `deploy_type: "cronjob"` — batch workloads, configured in `.partiri.jsonc` and
+  driven by the same `service create` / `push` / `deploy` commands as everything
+  else. There is deliberately no separate command family: a cronjob is a service.
+
+  `scheduler` is the discriminator. Set it and the service renders as a
+  recurring Kubernetes CronJob; leave it out and the identical config is a
+  one-shot Job that runs once per deploy. The other ten cron fields
+  (`cronjob_time_zone`, `cronjob_concurrency_policy`, `cronjob_backoff_limit`,
+  `cronjob_ttl_seconds_after_finished`, `cronjob_starting_deadline_seconds`,
+  `cronjob_successful_jobs_history_limit`, `cronjob_failed_jobs_history_limit`,
+  `cronjob_suspend`, `cronjob_command`, and the required
+  `cronjob_active_deadline_seconds`) are written to the config only for a
+  cronjob — a block of inert keys in every other service's file would be noise.
+
+  `partiri validate` mirrors the API's own rules so a bad schedule fails before
+  a round-trip: five fields, runs at least five minutes apart, a deadline
+  between 1 and 3600 seconds, a known concurrency policy, and a `run_command` or
+  `registry_url` to actually execute. The schedule check expands the minute
+  field and takes the tightest gap between fires; the wrap into the next hour
+  counts only when the hour field lets two consecutive hours fire, so
+  `0,58 0 * * *` — once a day at 00:00 and 00:58 — is read as the 58-minute gap
+  it is rather than a 2-minute one. A field it cannot expand is passed through
+  for the API's real cron parser to judge, so it never blocks a schedule the
+  server would have accepted.
+
+  `partiri init` offers `cronjob` in the service-type picker and asks only for
+  the two fields the API requires, writing the rest as commented examples.
+
+- Per-run cost estimates for a cronjob, which is metered per run on actual
+  duration and never billed a flat month. `service create` prints the ceiling a
+  single run can reach at the configured timeout and puts it in the JSON
+  envelope as `max_cost_per_run_eur`, leaving `monthly_cost_eur` null.
+
+- A `scheduled-cronjob` entry in `partiri llm examples`, cronjob notes in
+  `partiri llm explain service create` and `explain validate`, and a
+  cronjob-aware `partiri llm template --deploy-type cronjob`.
+
+### Fixed
+
+- `partiri service pull` now round-trips the cron configuration. The client
+  never deserialized `scheduler` or the `cronjob_*` columns, so pulling a
+  cronjob wrote a config declaring `deploy_type: "cronjob"` with no schedule and
+  no deadline — which `partiri validate` then rejected, and which `service push`
+  would have sent back as a job that never fires.
+
+### Changed
+
+- `partiri service push` no longer reports a monthly cost delta for a cronjob,
+  which is metered per run and never billed a flat month. It quotes the per-run
+  ceiling on each side instead, so changing only the deadline — an edit a
+  monthly figure hides entirely — shows up as the cost change it is.
+
 ## [0.4.0] — 2026-08-06
 
 ### Added

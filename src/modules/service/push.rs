@@ -2,8 +2,10 @@
 //!
 //! Storage is intentionally out of scope: the `disk` block is provisioned by
 //! `partiri storage create` and changed by `partiri storage update`. Push only
-//! updates the `services` row and reports the pod/region monthly-cost delta. It
-//! never creates, resizes, detaches, or deletes a volume.
+//! updates the `services` row and reports the pod cost change — a monthly delta
+//! for a long-running service, or the per-run ceiling for a cronjob, which is
+//! metered per run and never billed a flat month. It never creates, resizes,
+//! detaches, or deletes a volume.
 //!
 //! As a convenience it inspects the live volume and, when the local `disk`
 //! block diverges from it, prints a hint pointing at the right `storage`
@@ -35,11 +37,46 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
         .as_ref()
         .and_then(|vols| find_service_volume(vols, id));
 
-    let current_cost = compute_pod_monthly_cost(
-        live_service.as_ref().and_then(|s| s.fk_pod.as_deref()),
-        pricing.as_ref(),
-    );
-    let desired_cost = compute_pod_monthly_cost(Some(&config.service.fk_pod), pricing.as_ref());
+    // A cronjob is metered per run on actual duration and never billed a flat
+    // month, so a monthly delta would be a number that never appears on the
+    // bill. `service create` already refuses to quote one; push has to agree.
+    let is_cronjob = config.service.deploy_type == "cronjob";
+
+    let current_cost = if is_cronjob {
+        None
+    } else {
+        compute_pod_monthly_cost(
+            live_service.as_ref().and_then(|s| s.fk_pod.as_deref()),
+            pricing.as_ref(),
+        )
+    };
+    let desired_cost = if is_cronjob {
+        None
+    } else {
+        compute_pod_monthly_cost(Some(&config.service.fk_pod), pricing.as_ref())
+    };
+
+    // What a cronjob gets instead: the ceiling one run can reach, before and
+    // after. Changing the deadline changes the worst case even when the pod is
+    // untouched, which is exactly the edit a monthly figure would hide.
+    let (current_run_cost, desired_run_cost) = if is_cronjob {
+        (
+            compute_max_run_cost(
+                live_service.as_ref().and_then(|s| s.fk_pod.as_deref()),
+                live_service
+                    .as_ref()
+                    .and_then(|s| s.cronjob_active_deadline_seconds),
+                pricing.as_ref(),
+            ),
+            compute_max_run_cost(
+                Some(&config.service.fk_pod),
+                config.service.cronjob_active_deadline_seconds,
+                pricing.as_ref(),
+            ),
+        )
+    } else {
+        (None, None)
+    };
 
     client.update_service(id, &config.service)?;
 
@@ -58,6 +95,8 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
                 "current_monthly_pod_cost_eur": current_cost,
                 "desired_monthly_pod_cost_eur": desired_cost,
                 "cost_delta_eur": delta,
+                "current_max_cost_per_run_eur": current_run_cost,
+                "max_cost_per_run_eur": desired_run_cost,
                 "disk_hint": disk_hint,
             }),
         );
@@ -67,12 +106,45 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
             let sign = if d >= 0.0 { "+" } else { "" };
             println!("  Monthly pod cost change: {}€{:.4}", sign, d);
         }
+        if let Some(cost) = desired_run_cost {
+            match current_run_cost.filter(|c| (c - cost).abs() > f64::EPSILON) {
+                Some(before) => println!(
+                    "  Billed per run — up to €{:.4} per run at the configured timeout (was €{:.4})",
+                    cost, before
+                ),
+                None => println!(
+                    "  Billed per run — up to €{:.4} per run at the configured timeout",
+                    cost
+                ),
+            }
+        }
         if let Some(hint) = &disk_hint {
             println!("  {} {}", "info:".cyan(), hint);
         }
     }
 
     Ok(())
+}
+
+/// Worst-case cost of a single cronjob run: the kill-timeout rounded up to whole
+/// minutes at the pod's per-minute rate. `None` when it cannot be quoted, so the
+/// caller stays silent rather than printing a misleading zero.
+///
+/// Mirrors `estimate_max_run_cost` in `service create`. A custom-sized pod is
+/// not quoted here: the class is minted server-side, so on a resize there is no
+/// id to price until the push lands.
+fn compute_max_run_cost(
+    pod_id: Option<&str>,
+    deadline_seconds: Option<u32>,
+    pricing: Option<&RegionPricing>,
+) -> Option<f64> {
+    let deadline = deadline_seconds.filter(|d| *d > 0)?;
+    let per_minute = pricing?
+        .pods
+        .iter()
+        .find(|p| Some(p.fk_pod.as_str()) == pod_id)
+        .map(|p| p.per_minute)?;
+    Some(f64::from(deadline.div_ceil(60)) * per_minute)
 }
 
 /// Compute the monthly cost of a pod from region pricing. Returns `None` when
@@ -157,6 +229,44 @@ mod tests {
         }
     }
 
+    // 43200 minutes a month, so a €43.20/month pod is €0.001/minute. A 10-minute
+    // deadline is 10 of those.
+    #[test]
+    fn max_run_cost_charges_the_deadline_in_whole_minutes() {
+        let pricing = sample_pricing("pod-a", 43200.0 / 1000.0);
+        let cost = compute_max_run_cost(Some("pod-a"), Some(600), Some(&pricing)).unwrap();
+        assert!((cost - 0.01).abs() < 1e-9, "got {cost}");
+    }
+
+    // A run is billed by the minute, so a partial minute costs a whole one --
+    // matching the API, which charges ceil(duration / 60).
+    #[test]
+    fn max_run_cost_rounds_a_partial_minute_up() {
+        let pricing = sample_pricing("pod-a", 43200.0 / 1000.0);
+        let cost = compute_max_run_cost(Some("pod-a"), Some(61), Some(&pricing)).unwrap();
+        assert!((cost - 0.002).abs() < 1e-9, "got {cost}");
+    }
+
+    // Without a deadline there is no ceiling to quote, and a zero would read as
+    // "this run is free".
+    #[test]
+    fn max_run_cost_is_none_without_a_usable_deadline() {
+        let pricing = sample_pricing("pod-a", 12.0);
+        assert!(compute_max_run_cost(Some("pod-a"), None, Some(&pricing)).is_none());
+        assert!(compute_max_run_cost(Some("pod-a"), Some(0), Some(&pricing)).is_none());
+    }
+
+    // An unknown or absent pod has no rate. Unlike the monthly path -- which
+    // treats a missing pod as €0 to keep the delta arithmetic total -- a run
+    // quote is printed on its own, so a zero would be a claim, not a baseline.
+    #[test]
+    fn max_run_cost_is_none_without_a_priced_pod() {
+        let pricing = sample_pricing("pod-a", 12.0);
+        assert!(compute_max_run_cost(Some("pod-x"), Some(600), Some(&pricing)).is_none());
+        assert!(compute_max_run_cost(None, Some(600), Some(&pricing)).is_none());
+        assert!(compute_max_run_cost(Some("pod-a"), Some(600), None).is_none());
+    }
+
     fn config_with_disk(pod: &str, disk: Option<DiskConfig>) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".into()),
@@ -183,6 +293,7 @@ mod tests {
                 maintenance_mode: false,
                 active: true,
                 env: None,
+                ..Default::default()
             },
         }
     }

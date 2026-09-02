@@ -24,6 +24,30 @@ fn estimate_monthly_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f
     Some(pod_price)
 }
 
+/// Worst-case cost of a SINGLE cronjob run: the kill-timeout rounded up to
+/// whole minutes at the pod's per-minute rate.
+///
+/// A cronjob is billed per run on its actual duration, never a flat month, so
+/// quoting it monthly would be meaningless — this is the ceiling a run can
+/// reach, not the expected charge. `None` when it cannot be quoted, so the
+/// caller says nothing rather than printing a misleading zero.
+fn estimate_max_run_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f64> {
+    let svc = &config.service;
+    let deadline = svc.cronjob_active_deadline_seconds?;
+    if deadline == 0 {
+        return None;
+    }
+    let minutes = f64::from(deadline.div_ceil(60));
+
+    let pricing = client.get_pricing(&svc.fk_region).ok()?;
+    let per_minute = pricing
+        .pods
+        .iter()
+        .find(|p| p.fk_pod == svc.fk_pod)
+        .map(|p| p.per_minute)?;
+    Some(minutes * per_minute)
+}
+
 /// Entry point for `partiri service create`. Refuses if the config already has
 /// an `id`, validates the config locally, registers the service with the API,
 /// then writes the assigned `id` back to `.partiri.jsonc`.
@@ -72,7 +96,18 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
     config.save()?;
 
     // Estimate monthly cost (non-fatal if pricing is unavailable)
-    let monthly_cost = estimate_monthly_cost(client, &config);
+    // A cronjob is metered per run, so a monthly figure would be wrong for it.
+    let is_cronjob = config.service.deploy_type == "cronjob";
+    let monthly_cost = if is_cronjob {
+        None
+    } else {
+        estimate_monthly_cost(client, &config)
+    };
+    let max_run_cost = if is_cronjob {
+        estimate_max_run_cost(client, &config)
+    } else {
+        None
+    };
 
     // JSON envelope carries plain strings (no ANSI). Trailing tip lines are
     // human-only — gate them on !ctx().json so we keep the "exactly one
@@ -83,6 +118,7 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
             "id": service.id,
             "external_sd_url": service.external_sd_url,
             "monthly_cost_eur": monthly_cost,
+            "max_cost_per_run_eur": max_run_cost,
         }),
     );
     if !ctx().json {
@@ -91,6 +127,12 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
         }
         if let Some(cost) = monthly_cost {
             println!("  Estimated monthly pod cost: €{:.4}", cost);
+        }
+        if let Some(cost) = max_run_cost {
+            println!(
+                "  Billed per run — up to €{:.4} per run at the configured timeout",
+                cost
+            );
         }
         // The disk block, if any, is provisioned separately — never on create.
         if config.service.disk.is_some() {

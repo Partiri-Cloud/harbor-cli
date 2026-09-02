@@ -218,6 +218,35 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // For private repos, set fk_service_secret to a repository-secret UUID:
     // "fk_service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
     };
+
+    // Only a cronjob reads these; on any other deploy type the API ignores
+    // them, which reads as success until the schedule never fires. The two the
+    // API requires are live keys, the rest are commented examples.
+    let cronjob_block = if deploy_type == "cronjob" {
+        format!(
+            r#"
+    // Batch workload. "scheduler" is the discriminator: set it and this runs as
+    // a recurring CronJob; omit it and it is a one-shot Job.
+    "scheduler": "0 3 * * *",              // daily at 03:00 UTC; runs must be >= {min} min apart
+    // Hard kill-timeout for one run, in seconds (1-{max}). REQUIRED: a run is
+    // billed per minute of actual duration, and this bounds its worst case.
+    "cronjob_active_deadline_seconds": 300,
+    // "cronjob_time_zone": "Europe/Lisbon",
+    // "cronjob_concurrency_policy": "Forbid",   // Allow | Forbid | Replace
+    // "cronjob_backoff_limit": 3,
+    // "cronjob_ttl_seconds_after_finished": 3600,
+    // "cronjob_starting_deadline_seconds": 120,
+    // "cronjob_successful_jobs_history_limit": 3,
+    // "cronjob_failed_jobs_history_limit": 1,
+    // "cronjob_suspend": false,                 // pause the schedule
+    // "cronjob_command": ["node", "job.js"],    // entrypoint override, as argv
+"#,
+            min = crate::config::MIN_CRON_INTERVAL_MINUTES,
+            max = crate::config::MAX_CRONJOB_DEADLINE_SECONDS,
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"{{
   // The service ID is assigned by 'partiri service create'; leave null until then.
@@ -228,7 +257,7 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
 
   "service": {{
     "name": "my-service",                  // ≤16 chars
-    "deploy_type": "{deploy_type}",        // webservice | static | private-service | worker
+    "deploy_type": "{deploy_type}",        // webservice | static | private-service | worker | cronjob
     "runtime": "{runtime}",
     "root_path": ".",
 
@@ -241,7 +270,7 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
 
     "fk_region": "<region UUID>",
     "fk_pod":    "<pod UUID>",
-
+{cronjob_block}
     // "health_check_path": "/health",
     "maintenance_mode": false,
     "active": true
@@ -371,6 +400,31 @@ pub fn run_examples() -> Result<()> {
                 "partiri init --template",
                 "partiri -j -y service create",
                 "partiri -j -y service deploy",
+            ]
+        },
+        {
+            "name": "scheduled-cronjob",
+            "description": "Recurring batch job. `scheduler` is the discriminator: set it and the service runs as a Kubernetes CronJob; omit it and the same config is a one-shot Job. Both need cronjob_active_deadline_seconds.",
+            "note": "A cronjob is billed PER RUN on actual duration, not a flat month — 'service create' quotes `max_cost_per_run_eur`, not `monthly_cost_eur`. The deadline is what the per-run balance pre-authorization is sized against, so it is required and capped at 3600s. Runs must be at least 5 minutes apart; '* * * * *' and '*/4 * * * *' are rejected.",
+            "constraints": {
+                "scheduler": "5-field cron expression, UTC unless cronjob_time_zone is set; minimum 5 minutes between fires",
+                "cronjob_active_deadline_seconds": "required, 1–3600",
+                "cronjob_concurrency_policy": ["Allow", "Forbid", "Replace"],
+                "source": "needs run_command (repository) or registry_url (image)",
+                "no_health_check": "a cronjob has no inbound network, so health_check_path is not used"
+            },
+            "jsonc": build_template("cronjob", "node", "repo"),
+            "commands": [
+                "partiri init --template",
+                "# edit .partiri.jsonc: set scheduler, cronjob_active_deadline_seconds, and real UUIDs",
+                "partiri -j validate",
+                "partiri -j -y service create",
+                "partiri -j -y service deploy",
+                "# Each run is a job; this is how you see them:",
+                "partiri -j service status",
+                "# Pause the schedule without deleting the service:",
+                "# set \"cronjob_suspend\": true in .partiri.jsonc, then:",
+                "partiri -j -y service push",
             ]
         },
         {
@@ -610,11 +664,13 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
         "validate" => vec![
             "Without --remote, only static/local checks run.",
             "--remote needs an API key.",
+            "Cron schedules are pre-checked here: 5 fields, and runs at least 5 minutes apart. The check reads the minute and hour fields; a field it cannot expand is passed through for the API's cron parser to judge, so validate passing is not a guarantee the schedule is accepted.",
         ],
         "service create" => vec![
             "Requires every fk_* field set in .partiri.jsonc; run validate --remote first.",
             "service.name must be ≤16 chars and unique within the project.",
-            "Your service MUST listen on the port given by the $PORT environment variable. The platform injects $PORT at runtime; hard-coding any other port will cause health-check failures.",
+            "Your service MUST listen on the port given by the $PORT environment variable. The platform injects $PORT at runtime; hard-coding any other port will cause health-check failures. This does not apply to a worker or a cronjob, neither of which takes inbound traffic.",
+            "deploy_type \"cronjob\" is billed per run on actual duration, so the response carries max_cost_per_run_eur (the ceiling implied by cronjob_active_deadline_seconds) instead of monthly_cost_eur.",
         ],
         "service deploy" => vec![
             "Destructive operation — pass -y to skip the confirmation in scripts.",
@@ -1195,6 +1251,17 @@ mod tests {
             "run_command",
             "fk_region",
             "fk_pod",
+            "scheduler",
+            "cronjob_time_zone",
+            "cronjob_active_deadline_seconds",
+            "cronjob_backoff_limit",
+            "cronjob_ttl_seconds_after_finished",
+            "cronjob_concurrency_policy",
+            "cronjob_starting_deadline_seconds",
+            "cronjob_successful_jobs_history_limit",
+            "cronjob_failed_jobs_history_limit",
+            "cronjob_suspend",
+            "cronjob_command",
             "health_check_path",
             "maintenance_mode",
             "active",

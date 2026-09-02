@@ -559,7 +559,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         .map_err(|_| "Cancelled.")?;
 
     // ── Deploy type ──
-    let deploy_type_options = vec!["webservice", "static", "private-service", "worker"];
+    let deploy_type_options = crate::config::DEPLOY_TYPES.to_vec();
     let deploy_type = Select::new("Service type:", deploy_type_options)
         .prompt()
         .map_err(|_| "Cancelled.")?
@@ -721,6 +721,42 @@ pub fn run(args: InitArgs) -> Result<()> {
         None
     };
 
+    // ── Cronjob schedule and timeout ──
+    // Only the two fields the API actually requires are asked for; the rest
+    // are written to the config as commented examples to edit later.
+    let (scheduler, cronjob_active_deadline_seconds) = if deploy_type == "cronjob" {
+        let schedule =
+            Text::new("Cron schedule (5 fields, leave empty for a one-shot job), e.g. 0 3 * * *:")
+                .prompt()
+                .map_err(|_| "Cancelled.")?;
+        let schedule = if schedule.trim().is_empty() {
+            None
+        } else {
+            Some(schedule.trim().to_string())
+        };
+
+        let deadline = Text::new("Max seconds a single run may take (kill-timeout):")
+            .with_default("300")
+            .with_validator(|v: &str| match v.trim().parse::<u32>() {
+                Ok(n) if n > 0 && n <= crate::config::MAX_CRONJOB_DEADLINE_SECONDS => {
+                    Ok(inquire::validator::Validation::Valid)
+                }
+                _ => Ok(inquire::validator::Validation::Invalid(
+                    format!(
+                        "Must be between 1 and {}",
+                        crate::config::MAX_CRONJOB_DEADLINE_SECONDS
+                    )
+                    .into(),
+                )),
+            })
+            .prompt()
+            .map_err(|_| "Cancelled.")?;
+
+        (schedule, deadline.trim().parse::<u32>().ok())
+    } else {
+        (None, None)
+    };
+
     // ── Assemble config ──
     let config = PartiriConfig {
         id: None,
@@ -742,11 +778,14 @@ pub fn run(args: InitArgs) -> Result<()> {
             run_command,
             fk_region,
             fk_pod,
+            scheduler,
+            cronjob_active_deadline_seconds,
             health_check_path,
             disk: None,
             maintenance_mode: false,
             active: true,
             env: None,
+            ..Default::default()
         },
     };
 
@@ -796,6 +835,7 @@ fn write_template() -> Result<()> {
             maintenance_mode: false,
             active: true,
             env: None,
+            ..Default::default()
         },
     };
     config.save()?;

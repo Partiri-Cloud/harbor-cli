@@ -304,6 +304,50 @@ Naming rules mirror PostgreSQL's own: `--db-name` and `--db-user` must match
 `^[a-z_][a-z0-9_]{0,62}$`, and `template0`, `template1`, and `postgres` are
 reserved. The CLI checks all of this locally before calling the API.
 
+### Scheduled jobs and one-shot runs
+
+A batch workload is an ordinary service with `deploy_type: "cronjob"` — it lives
+in `.partiri.jsonc` and uses the same `service create` / `push` / `deploy`
+commands as everything else. There is no separate `cronjob` command family.
+
+**`scheduler` is the discriminator.** Set it and the service runs as a recurring
+Kubernetes CronJob; leave it out and the identical config is a one-shot Job that
+runs once per deploy.
+
+```jsonc
+"deploy_type": "cronjob",
+"run_command": "node job.js",             // what each run executes
+"scheduler": "0 3 * * *",                 // daily at 03:00 — omit for a one-shot Job
+"cronjob_active_deadline_seconds": 900    // required: kill-timeout for one run
+```
+
+Then:
+
+```bash
+partiri validate                # checks the schedule before the API sees it
+partiri service create
+partiri service deploy
+```
+
+Things worth knowing before you write the schedule:
+
+- **Runs must be at least 5 minutes apart.** `* * * * *` and `*/4 * * * *` are
+  rejected. The floor bounds cluster churn and the volume of per-run ledger
+  entries. `partiri validate` catches the common shapes locally; the API's cron
+  parser is authoritative, so an exotic expression may still be refused there.
+- **`cronjob_active_deadline_seconds` is required and capped at 3600.** It is the
+  hard kill-timeout for a single run, and it is what the per-run balance
+  pre-authorization is sized against.
+- **Billing is per run, on actual duration** — not a flat month. `service create`
+  reflects this: it prints the ceiling a single run can reach at the configured
+  timeout (`max_cost_per_run_eur` in `-j`) instead of a monthly figure.
+- **A cronjob always runs a single replica.**
+- **No inbound network**, so `health_check_path` does not apply.
+- **Pause without deleting** by setting `"cronjob_suspend": true` and running
+  `partiri service push`.
+
+Schedules are read in UTC unless you set `cronjob_time_zone` to an IANA zone.
+
 ### Discovery
 
 These commands list resources by UUID — useful for filling in a `.partiri.jsonc` by hand:
@@ -361,7 +405,8 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
   "service": {
     "name": "my-service",
 
-    // "webservice" | "static" | "private-service" | "worker"
+    // "webservice" | "static" | "private-service" | "worker" | "cronjob"
+    // Managed databases are not configured here — use 'partiri db create'.
     "deploy_type": "webservice",
 
     // "node" | "deno" | "rust" | "python" | "go" | "ruby" | "elixir" | "php" | "jvm" | "dotnet" | "cpp" | "static" | "registry"
@@ -389,6 +434,15 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 
     "health_check_path": "/health",
 
+    // Batch workloads only (deploy_type "cronjob"). "scheduler" is the
+    // discriminator: set it for a recurring CronJob, omit it for a one-shot Job.
+    // "scheduler": "0 3 * * *",                  // min 5 minutes between runs
+    // "cronjob_active_deadline_seconds": 300,    // required for a cronjob, 1–3600
+    // "cronjob_time_zone": "Europe/Lisbon",
+    // "cronjob_concurrency_policy": "Forbid",    // Allow | Forbid | Replace
+    // "cronjob_suspend": false,                  // pause the schedule
+    // "cronjob_command": ["node", "job.js"],     // entrypoint override, as argv
+
     "maintenance_mode": false,
     "active": true,
 
@@ -412,7 +466,7 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | `fk_workspace`                     | Yes       | UUID of the target workspace.                                               |
 | `fk_project`                       | Yes       | UUID of the target project. Must belong to `fk_workspace`.                  |
 | `service.name`                     | Yes       | Service name (≤16 chars), unique within the project.                        |
-| `service.deploy_type`              | Yes       | `webservice`, `static`, `private-service`, or `worker`.                     |
+| `service.deploy_type`              | Yes       | `webservice`, `static`, `private-service`, `worker`, or `cronjob`. Managed databases are not services — see `partiri db`. |
 | `service.runtime`                  | Yes       | `node`, `deno`, `rust`, `python`, `go`, `ruby`, `elixir`, `php`, `jvm`, `dotnet`, `cpp`, `static`, or `registry`. |
 | `service.root_path`                | Yes       | Path to the app root within the repository.                                 |
 | `service.repository_url`           | *Either*  | Git repository URL. Mutually exclusive with `registry_url`.                 |
@@ -422,10 +476,21 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | `service.build_command`            | Cond.     | Build command. Required for repository sources on non-static runtimes.      |
 | `service.build_path`               | No        | Build output directory (e.g. `dist`).                                       |
 | `service.pre_deploy_command`       | No        | Command run before each deploy (e.g. DB migrations).                        |
-| `service.run_command`              | Cond.     | Start command. Required for `webservice`, `private-service`, and source-built `worker`. |
+| `service.run_command`              | Cond.     | Start command. Required for `webservice`, `private-service`, and source-built `worker`. A `cronjob` needs this or `registry_url` — it is the command each run executes. |
 | `service.fk_region`                | Yes       | Region UUID. List via `partiri regions list --workspace <UUID>`.            |
 | `service.fk_pod`                   | Yes       | Compute pod UUID (CPU/RAM tier). List via `partiri pods list --workspace <UUID>`. |
-| `service.health_check_path`        | No        | Health-check path or absolute URL. `null` disables the check.               |
+| `service.health_check_path`        | No        | Health-check path or absolute URL. `null` disables the check. Not used by `worker` or `cronjob`, neither of which takes inbound traffic. |
+| `service.scheduler`                | Cond.     | 5-field cron expression, e.g. `0 3 * * *`. **The discriminator for batch workloads**: present → recurring CronJob, absent → one-shot Job. Only valid on `deploy_type: "cronjob"`; the API ignores it elsewhere. Runs must be at least 5 minutes apart. |
+| `service.cronjob_active_deadline_seconds` | Cond. | **Required for `cronjob`**, 1–3600. Hard kill-timeout for a single run. Runs are billed per minute of actual duration, and this is what the per-run balance pre-authorization is sized against. |
+| `service.cronjob_time_zone`        | No        | IANA timezone the schedule is read in (e.g. `Europe/Lisbon`). Defaults to UTC. |
+| `service.cronjob_concurrency_policy` | No      | `Allow`, `Forbid`, or `Replace` — what to do when a run is still going as the next is due. |
+| `service.cronjob_backoff_limit`    | No        | Retries before a run counts as failed.                                      |
+| `service.cronjob_starting_deadline_seconds` | No | Grace period, in seconds, for a schedule that was missed.                 |
+| `service.cronjob_ttl_seconds_after_finished` | No | Seconds a finished run's pod is kept before cleanup.                     |
+| `service.cronjob_successful_jobs_history_limit` | No | How many successful runs to keep in history.                          |
+| `service.cronjob_failed_jobs_history_limit` | No | How many failed runs to keep in history.                                 |
+| `service.cronjob_suspend`          | No        | `true` pauses the schedule without deleting the service.                    |
+| `service.cronjob_command`          | No        | Container entrypoint override, as an argv array (e.g. `["node", "job.js"]`). |
 | `service.disk`                     | No        | Persistent volume: `{ "mount_path": "/app/data", "size": <1–10 GB> }`. Declarative config only — provision the volume with `partiri storage create` and change it with `partiri storage update`. `service create`/`push` never touch storage; `service pull` adopts the live volume's mount path and size into this block when a volume exists (warning if it replaces a diverging local edit), and preserves a block declared for a not-yet-run `storage create`. |
 | `service.maintenance_mode`         | No        | Serve a maintenance page instead of the app.                                |
 | `service.active`                   | No        | Whether the service is active.                                              |
