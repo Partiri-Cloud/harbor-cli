@@ -270,6 +270,14 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
 
     "fk_region": "<region UUID>",
     "fk_pod":    "<pod UUID>",
+
+    // Custom pod size, used INSTEAD of fk_pod (leave fk_pod empty). Must sit on
+    // the step grid from 'partiri pods list --region <id>'.
+    // "custom_pod": {{ "vcpu_millicores": 1000, "memory_mib": 1024 }},
+
+    // Pods to run IN EACH region (default 1). Total pods, and the monthly bill,
+    // is this times the number of regions. Always 1 for cronjob and database.
+    // "replica_count": 2,
 {cronjob_block}
     // "health_check_path": "/health",
     "maintenance_mode": false,
@@ -410,6 +418,7 @@ pub fn run_examples() -> Result<()> {
                 "scheduler": "5-field cron expression, UTC unless cronjob_time_zone is set; minimum 5 minutes between fires",
                 "cronjob_active_deadline_seconds": "required, 1–3600",
                 "cronjob_concurrency_policy": ["Allow", "Forbid", "Replace"],
+                "replica_count": "always 1 — a cronjob cannot be scaled",
                 "source": "needs run_command (repository) or registry_url (image)",
                 "no_health_check": "a cronjob has no inbound network, so health_check_path is not used"
             },
@@ -671,6 +680,7 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
             "service.name must be ≤16 chars and unique within the project.",
             "Your service MUST listen on the port given by the $PORT environment variable. The platform injects $PORT at runtime; hard-coding any other port will cause health-check failures. This does not apply to a worker or a cronjob, neither of which takes inbound traffic.",
             "deploy_type \"cronjob\" is billed per run on actual duration, so the response carries max_cost_per_run_eur (the ceiling implied by cronjob_active_deadline_seconds) instead of monthly_cost_eur.",
+            "Set custom_pod instead of fk_pod for an off-catalogue size; leave fk_pod empty. Sending both is rejected locally, because the API silently prefers custom_pod and would discard the named pod.",
         ],
         "service deploy" => vec![
             "Destructive operation — pass -y to skip the confirmation in scripts.",
@@ -961,7 +971,9 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
 
         // Fetch pricing for the first region to annotate pods with monthly cost.
         // Uses the first region as a best-effort default; pricing is per-region.
-        let pricing = regions.first().and_then(|r| client.get_pricing(&r.id).ok());
+        let pricing = regions
+            .first()
+            .and_then(|r| client.get_pricing(&r.id, &[]).ok());
 
         let balance = client.get_balance(&w.id).ok();
 
@@ -1251,6 +1263,8 @@ mod tests {
             "run_command",
             "fk_region",
             "fk_pod",
+            "custom_pod",
+            "replica_count",
             "scheduler",
             "cronjob_time_zone",
             "cronjob_active_deadline_seconds",

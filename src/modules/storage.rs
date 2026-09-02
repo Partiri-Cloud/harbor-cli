@@ -544,6 +544,8 @@ mod tests {
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {
+                custom_pod: None,
+                replica_count: None,
                 name: "My Service".to_string(),
                 deploy_type: "webservice".to_string(),
                 runtime: "node".to_string(),

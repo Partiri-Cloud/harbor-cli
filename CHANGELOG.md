@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `custom_pod` — an off-catalogue compute size (`vcpu_millicores` + `memory_mib`)
+  used instead of `fk_pod`. Requests equal limits, so the size asked for is what
+  the service is guaranteed and billed for. `partiri pods list --region <UUID>`
+  now reports the allowed range, step, and this region's rate below the pod
+  table, and as a `custom_pod` object in the `-j` envelope — it is the only place
+  that grid is published, and a size off it is rejected at deploy time.
+  Setting both `fk_pod` and `custom_pod` is refused locally, because the API
+  silently prefers `custom_pod` and would discard the named pod without a word.
+
+- `replica_count` — pods to run in each region. Total pods, and the monthly
+  bill, is this times the number of regions; the cost estimates in `service
+  create` and the `service push` delta both account for it. Pinned to one for
+  cronjob and database services, matching the server-side constraint.
+
+- Rate-card pricing for a custom-sized service, which has no pod id to look up
+  because its class is minted server-side on create. `service create` quotes it
+  from the region's rate card; `service push` omits the delta on a resize rather
+  than inventing one.
+
+- Custom-pod notes in `partiri llm explain service create`.
+
+### Changed
+
+- `partiri pods list --region` no longer suppresses the custom-size grid in
+  `-j` mode. Agents run the CLI with `-j`, and the config documentation points
+  at this command for the allowed range and step.
+
 ## [0.5.0] — 2026-09-02
 
 ### Added

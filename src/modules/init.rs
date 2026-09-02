@@ -388,7 +388,7 @@ pub(crate) fn prompt_for_pod(
                 // Best-effort: an unpriced list is worse than a priced one but far
                 // better than failing the wizard, so a pricing error only warns.
                 let pricing = match region_id {
-                    Some(r) => match c.get_pricing(r) {
+                    Some(r) => match c.get_pricing(r, &[]) {
                         Ok(p) => Some(p),
                         Err(e) => {
                             print_warning(&format!(

@@ -464,6 +464,14 @@ pub(crate) fn map_to_config(
                 .fk_pod
                 .filter(|s| !s.is_empty())
                 .ok_or("Pulled service is missing fk_pod")?,
+            // A custom-sized service pulls back as its RESOLVED pod id, which
+            // is a real, priced pod class — pushing that id again is correct
+            // and re-mints nothing. custom_pod is only for asking for a NEW
+            // size, so it is never populated from a pull.
+            custom_pod: None,
+            // Omitted from the file when it is the default of one, so an
+            // unscaled service's config stays as short as it was before.
+            replica_count: svc.replica_count.filter(|n| *n > 1),
 
             // Cron fields round-trip verbatim. Dropping them would write a
             // config declaring `deploy_type: "cronjob"` with no schedule and no
@@ -610,6 +618,8 @@ mod apply_live_disk_tests {
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {
+                custom_pod: None,
+                replica_count: None,
                 name: "svc".to_string(),
                 deploy_type: "webservice".to_string(),
                 runtime: "node".to_string(),
@@ -728,6 +738,7 @@ mod tests {
 
     fn make_service() -> Service {
         Service {
+            replica_count: None,
             id: "svc-123".to_string(),
             name: "my-service".to_string(),
             deploy_type: "webservice".to_string(),
@@ -1120,6 +1131,8 @@ mod overwrite_guard_tests {
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {
+                custom_pod: None,
+                replica_count: None,
                 name: "svc".to_string(),
                 deploy_type: "webservice".to_string(),
                 runtime: "node".to_string(),
@@ -1204,6 +1217,8 @@ mod apply_live_pod_tests {
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {
+                custom_pod: None,
+                replica_count: None,
                 name: "svc".to_string(),
                 deploy_type: "webservice".to_string(),
                 runtime: "node".to_string(),

@@ -31,11 +31,36 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     // are best-effort: a failure just drops the corresponding extra output.
     let live_service = client.read_service(id).ok();
     let volumes = client.list_volumes(&config.fk_project).ok();
-    let pricing = client.get_pricing(&config.service.fk_region).ok();
+    // Both the live pod and the desired one are named: either may be a custom
+    // class, which the catalogue response omits.
+    let live_pod_id = live_service
+        .as_ref()
+        .and_then(|s| s.fk_pod.as_deref())
+        .unwrap_or("");
+    // Empty ids are skipped: `fk_pod` is blank on a custom-sized service, and
+    // sending `pods=` would ask the API to price the empty string.
+    let mut priced_pods: Vec<&str> = Vec::new();
+    if !config.service.fk_pod.is_empty() {
+        priced_pods.push(config.service.fk_pod.as_str());
+    }
+    if !live_pod_id.is_empty() && live_pod_id != config.service.fk_pod {
+        priced_pods.push(live_pod_id);
+    }
+    let pricing = client
+        .get_pricing(&config.service.fk_region, &priced_pods)
+        .ok();
 
     let current_vol = volumes
         .as_ref()
         .and_then(|vols| find_service_volume(vols, id));
+
+    // Compared at each side's OWN replica count, so a pure scale shows up as a
+    // delta even when the pod class is unchanged.
+    let current_replicas = live_service
+        .as_ref()
+        .and_then(|s| s.replica_count)
+        .unwrap_or(1);
+    let desired_replicas = config.service.replica_count.unwrap_or(1);
 
     // A cronjob is metered per run on actual duration and never billed a flat
     // month, so a monthly delta would be a number that never appears on the
@@ -48,12 +73,20 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
         compute_pod_monthly_cost(
             live_service.as_ref().and_then(|s| s.fk_pod.as_deref()),
             pricing.as_ref(),
+            current_replicas,
         )
     };
-    let desired_cost = if is_cronjob {
+    // A custom resize is deliberately not quoted: the new class does not exist
+    // until the push lands, so there is no id to price. Better no delta than a
+    // made-up one.
+    let desired_cost = if is_cronjob || config.service.custom_pod.is_some() {
         None
     } else {
-        compute_pod_monthly_cost(Some(&config.service.fk_pod), pricing.as_ref())
+        compute_pod_monthly_cost(
+            Some(&config.service.fk_pod),
+            pricing.as_ref(),
+            desired_replicas,
+        )
     };
 
     // What a cronjob gets instead: the ceiling one run can reach, before and
@@ -149,17 +182,23 @@ fn compute_max_run_cost(
 
 /// Compute the monthly cost of a pod from region pricing. Returns `None` when
 /// pricing (or the pod id) is unavailable.
-fn compute_pod_monthly_cost(pod_id: Option<&str>, pricing: Option<&RegionPricing>) -> Option<f64> {
+fn compute_pod_monthly_cost(
+    pod_id: Option<&str>,
+    pricing: Option<&RegionPricing>,
+    replicas: u32,
+) -> Option<f64> {
     let pricing = pricing?;
     let pod_id = pod_id?;
-    Some(
-        pricing
-            .pods
-            .iter()
-            .find(|p| p.fk_pod == pod_id)
-            .map(|p| p.price)
-            .unwrap_or(0.0),
-    )
+    let unit = pricing
+        .pods
+        .iter()
+        .find(|p| p.fk_pod == pod_id)
+        .map(|p| p.price)
+        .unwrap_or(0.0);
+    // Each region runs `replicas` pods and is billed a month per pod. Push
+    // never changes the region set, so the region count scales both sides of
+    // the delta equally and cancels out of it.
+    Some(unit * f64::from(replicas.max(1)))
 }
 
 /// Describe how the local `disk` block diverges from the live volume, if at
@@ -274,6 +313,8 @@ mod tests {
             fk_workspace: "ws".into(),
             fk_project: "p".into(),
             service: ServiceConfig {
+                custom_pod: None,
+                replica_count: None,
                 name: "svc".into(),
                 deploy_type: "webservice".into(),
                 runtime: "node".into(),
@@ -304,27 +345,63 @@ mod tests {
     fn pod_cost_looks_up_price() {
         let pricing = sample_pricing("pod-a", 12.0);
         assert_eq!(
-            compute_pod_monthly_cost(Some("pod-a"), Some(&pricing)),
+            compute_pod_monthly_cost(Some("pod-a"), Some(&pricing), 1),
             Some(12.0)
         );
     }
 
     #[test]
     fn pod_cost_none_without_pricing() {
-        assert!(compute_pod_monthly_cost(Some("pod-a"), None).is_none());
+        assert!(compute_pod_monthly_cost(Some("pod-a"), None, 1).is_none());
+    }
+
+    // Each region runs `replicas` pods and is billed a month per pod, so a
+    // quote that ignores the count understates the real cost.
+    #[test]
+    fn pod_cost_scales_with_replicas() {
+        let pricing = RegionPricing {
+            pods: vec![PodPrice {
+                fk_pod: "pod-a".to_string(),
+                price: 10.0,
+                per_minute: 0.0,
+            }],
+            volume_price_per_gb: 0.0,
+        };
+        assert_eq!(
+            compute_pod_monthly_cost(Some("pod-a"), Some(&pricing), 3),
+            Some(30.0)
+        );
+    }
+
+    // A count of zero would be nonsense from the API; treat it as one rather
+    // than quoting the service at nothing.
+    #[test]
+    fn pod_cost_floors_replicas_at_one() {
+        let pricing = RegionPricing {
+            pods: vec![PodPrice {
+                fk_pod: "pod-a".to_string(),
+                price: 10.0,
+                per_minute: 0.0,
+            }],
+            volume_price_per_gb: 0.0,
+        };
+        assert_eq!(
+            compute_pod_monthly_cost(Some("pod-a"), Some(&pricing), 0),
+            Some(10.0)
+        );
     }
 
     #[test]
     fn pod_cost_none_without_pod_id() {
         let pricing = sample_pricing("pod-a", 12.0);
-        assert!(compute_pod_monthly_cost(None, Some(&pricing)).is_none());
+        assert!(compute_pod_monthly_cost(None, Some(&pricing), 1).is_none());
     }
 
     #[test]
     fn pod_cost_unknown_pod_is_zero() {
         let pricing = sample_pricing("pod-a", 12.0);
         assert_eq!(
-            compute_pod_monthly_cost(Some("pod-x"), Some(&pricing)),
+            compute_pod_monthly_cost(Some("pod-x"), Some(&pricing), 1),
             Some(0.0)
         );
     }
@@ -346,8 +423,8 @@ mod tests {
             ],
             volume_price_per_gb: 5.0,
         };
-        let current = compute_pod_monthly_cost(Some("pod-old"), Some(&pricing));
-        let desired = compute_pod_monthly_cost(Some("pod-new"), Some(&pricing));
+        let current = compute_pod_monthly_cost(Some("pod-old"), Some(&pricing), 1);
+        let desired = compute_pod_monthly_cost(Some("pod-new"), Some(&pricing), 1);
         assert_eq!(desired.unwrap() - current.unwrap(), 10.0);
     }
 

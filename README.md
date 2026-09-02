@@ -341,7 +341,7 @@ Things worth knowing before you write the schedule:
 - **Billing is per run, on actual duration** — not a flat month. `service create`
   reflects this: it prints the ceiling a single run can reach at the configured
   timeout (`max_cost_per_run_eur` in `-j`) instead of a monthly figure.
-- **A cronjob always runs a single replica.**
+- **A cronjob always runs a single replica.** `replica_count` above 1 is rejected.
 - **No inbound network**, so `health_check_path` does not apply.
 - **Pause without deleting** by setting `"cronjob_suspend": true` and running
   `partiri service push`.
@@ -358,7 +358,7 @@ These commands list resources by UUID — useful for filling in a `.partiri.json
 | `partiri projects list --workspace <UUID>`       | List all projects in a workspace             |
 | `partiri service list --project <UUID>`          | List all services in a project               |
 | `partiri regions list --workspace <UUID>`        | List the regions available in a workspace    |
-| `partiri pods list --workspace <UUID>`           | List the compute pods available in a workspace; add `--region <UUID>` to include a monthly price column |
+| `partiri pods list --workspace <UUID>`           | List the compute pods available in a workspace; add `--region <UUID>` to include a monthly price column and the custom-size range, step, and rate |
 
 ### `partiri llm <subcommand>`
 
@@ -432,6 +432,14 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
     "fk_region": "<region-uuid>",
     "fk_pod": "<pod-uuid>",
 
+    // Off-catalogue size, used INSTEAD of fk_pod (leave fk_pod empty). Must sit
+    // on the step grid from 'partiri pods list --region <uuid>'.
+    // "custom_pod": { "vcpu_millicores": 1000, "memory_mib": 1024 },
+
+    // Pods to run IN EACH region (default 1). Total pods — and the monthly
+    // bill — is this times the number of regions. Always 1 for a cronjob.
+    // "replica_count": 2,
+
     "health_check_path": "/health",
 
     // Batch workloads only (deploy_type "cronjob"). "scheduler" is the
@@ -478,7 +486,9 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | `service.pre_deploy_command`       | No        | Command run before each deploy (e.g. DB migrations).                        |
 | `service.run_command`              | Cond.     | Start command. Required for `webservice`, `private-service`, and source-built `worker`. A `cronjob` needs this or `registry_url` — it is the command each run executes. |
 | `service.fk_region`                | Yes       | Region UUID. List via `partiri regions list --workspace <UUID>`.            |
-| `service.fk_pod`                   | Yes       | Compute pod UUID (CPU/RAM tier). List via `partiri pods list --workspace <UUID>`. |
+| `service.fk_pod`                   | *Either*  | Compute pod UUID (CPU/RAM tier). List via `partiri pods list --workspace <UUID>`. Leave empty when `custom_pod` is set. |
+| `service.custom_pod`               | *Either*  | Off-catalogue size: `{ "vcpu_millicores": <n>, "memory_mib": <n> }`. Used **instead of** `fk_pod`; setting both is rejected, because the API silently prefers `custom_pod`. Requests equal limits, so these are what you are guaranteed and billed for. Both values must sit on the step grid `partiri pods list --region <UUID>` reports. |
+| `service.replica_count`            | No        | Pods to run **in each region** (default 1). Total pods — and the monthly bill — is this times the number of regions. Must be 1 for a `cronjob`. |
 | `service.health_check_path`        | No        | Health-check path or absolute URL. `null` disables the check. Not used by `worker` or `cronjob`, neither of which takes inbound traffic. |
 | `service.scheduler`                | Cond.     | 5-field cron expression, e.g. `0 3 * * *`. **The discriminator for batch workloads**: present → recurring CronJob, absent → one-shot Job. Only valid on `deploy_type: "cronjob"`; the API ignores it elsewhere. Runs must be at least 5 minutes apart. |
 | `service.cronjob_active_deadline_seconds` | Cond. | **Required for `cronjob`**, 1–3600. Hard kill-timeout for a single run. Runs are billed per minute of actual duration, and this is what the per-run balance pre-authorization is sized against. |

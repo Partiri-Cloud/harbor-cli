@@ -14,15 +14,40 @@ use crate::output::{ctx, print_success_with};
 /// `partiri storage create`), so folding the declared `disk` block into this
 /// figure would bill for storage that does not exist yet.
 fn estimate_monthly_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f64> {
-    let pricing = client.get_pricing(&config.service.fk_region).ok()?;
+    let svc = &config.service;
+    // Every region runs `replica_count` pods and is billed a month per pod.
+    // `service create` sends one region, so the multiplier is the count itself.
+    let replicas = f64::from(svc.replica_count.unwrap_or(1).max(1));
+
+    // A custom size has no pod id yet -- the class is minted by the server on
+    // create -- so it is priced from the region's rate card instead.
+    if let Some(custom) = &svc.custom_pod {
+        let options = client
+            .get_custom_pod_options(&[svc.fk_region.as_str()])
+            .ok()?;
+        let unit = options.price(custom.vcpu_millicores, custom.memory_mib, &svc.fk_region)?;
+        return Some(unit * replicas);
+    }
+
+    let pricing = client
+        .get_pricing(&svc.fk_region, &[svc.fk_pod.as_str()])
+        .ok()?;
     let pod_price = pricing
         .pods
         .iter()
-        .find(|p| p.fk_pod == config.service.fk_pod)
+        .find(|p| p.fk_pod == svc.fk_pod)
         .map(|p| p.price)
         .unwrap_or(0.0);
-    Some(pod_price)
+    Some(pod_price * replicas)
 }
+
+/// Minutes the API bills as one month: 30 days × 24 hours × 60 minutes.
+///
+/// The catalogue pricing endpoint derives its `per_minute` from the monthly
+/// price with exactly this divisor, so a custom pod — which is quoted monthly
+/// and has no `per_minute` field — has to use the same one to agree with what
+/// the ledger will actually charge.
+const BILLED_MINUTES_PER_MONTH: f64 = 30.0 * 24.0 * 60.0;
 
 /// Worst-case cost of a SINGLE cronjob run: the kill-timeout rounded up to
 /// whole minutes at the pod's per-minute rate.
@@ -39,7 +64,20 @@ fn estimate_max_run_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f
     }
     let minutes = f64::from(deadline.div_ceil(60));
 
-    let pricing = client.get_pricing(&svc.fk_region).ok()?;
+    // A custom size is priced from the rate card, same as the monthly estimate:
+    // there is no pod id to look up, because the class is minted on create.
+    // Without this a custom-sized cronjob printed no cost line at all.
+    if let Some(custom) = &svc.custom_pod {
+        let options = client
+            .get_custom_pod_options(&[svc.fk_region.as_str()])
+            .ok()?;
+        let monthly = options.price(custom.vcpu_millicores, custom.memory_mib, &svc.fk_region)?;
+        return Some(minutes * (monthly / BILLED_MINUTES_PER_MONTH));
+    }
+
+    let pricing = client
+        .get_pricing(&svc.fk_region, &[svc.fk_pod.as_str()])
+        .ok()?;
     let per_minute = pricing
         .pods
         .iter()

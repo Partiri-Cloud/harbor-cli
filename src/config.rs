@@ -283,8 +283,17 @@ pub struct ServiceConfig {
 
     /// Region UUID the service is deployed to.
     pub fk_region: String,
-    /// Compute pod UUID — determines the CPU/RAM tier.
+    /// Compute pod UUID — determines the CPU/RAM tier. Leave empty when
+    /// `custom_pod` is set; the server resolves the class and fills this in.
     pub fk_pod: String,
+    /// A custom size instead of a catalogue pod. Mutually exclusive with a
+    /// non-empty `fk_pod`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_pod: Option<CustomPodSpec>,
+    /// Pods to run IN EACH region. Total pods, and the monthly bill, is this
+    /// times the number of regions. `None` means one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica_count: Option<u32>,
     // pub fk_disk_pod: String,
 
     // ── Batch workloads (deploy_type "cronjob") ──────────────────────────
@@ -360,6 +369,19 @@ pub struct ServiceConfig {
     #[schemars(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<Vec<EnvVar>>,
+}
+
+/// A custom pod size, in place of a catalogue tier.
+///
+/// Requests equal limits for a custom pod, so these are what the service is
+/// guaranteed AND billed for. Both must sit on the step grid
+/// `partiri pods list` reports, or the server rejects the deploy.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CustomPodSpec {
+    /// CPU in millicores, e.g. 1000 for one core.
+    pub vcpu_millicores: u32,
+    /// Memory in MiB, e.g. 1024 for one GB.
+    pub memory_mib: u32,
 }
 
 /// Declarative disk (persistent volume) configuration within [`ServiceConfig`].
@@ -546,6 +568,40 @@ impl PartiriConfig {
                 .to_string(),
         };
 
+        // Only written when set, so an unscaled catalogue-pod service keeps the
+        // same short config it had before these fields existed.
+        let replica_section = match svc.replica_count.filter(|n| *n > 1) {
+            Some(n) => format!(
+                r#"
+    // Pods to run IN EACH region. Total pods -- and the monthly bill -- is this
+    // times the number of regions. Always 1 for cronjob and database services.
+    "replica_count": {n},"#
+            ),
+            None => r#"
+    // Pods to run in each region (optional, default 1).
+    // "replica_count": 2,"#
+                .to_string(),
+        };
+
+        let custom_pod_section = match &svc.custom_pod {
+            Some(c) => format!(
+                r#"
+    // Custom pod size, used INSTEAD of fk_pod. Requests equal limits, so these
+    // are what the service is guaranteed and billed for. Run
+    // 'partiri pods list --region <id>' for the allowed range and step.
+    "custom_pod": {{
+      "vcpu_millicores": {},
+      "memory_mib": {}
+    }},"#,
+                c.vcpu_millicores, c.memory_mib
+            ),
+            None => r#"
+    // Custom pod size (optional), used instead of fk_pod. Run
+    // 'partiri pods list --region <id>' for the allowed range and step.
+    // "custom_pod": { "vcpu_millicores": 1000, "memory_mib": 1024 },"#
+                .to_string(),
+        };
+
         // Written only for a cronjob: every other deploy type ignores these, and
         // a block of eleven inert keys in every config would be noise.
         let cronjob_section = if svc.deploy_type == "cronjob" {
@@ -700,7 +756,10 @@ impl PartiriConfig {
     "fk_region": {},
 
     // Compute pod — determines CPU and RAM allocated to the service.
+    // Leave empty when "custom_pod" is set; the server resolves it.
     "fk_pod": {},
+{}
+{}
 {}
 
 {}
@@ -733,6 +792,8 @@ impl PartiriConfig {
             json_opt_str(&svc.run_command),
             json_str(&svc.fk_region),
             json_str(&svc.fk_pod),
+            custom_pod_section,
+            replica_section,
             cronjob_section,
             health_section,
             disk_section,
@@ -810,7 +871,33 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
         "root_path is required",
     );
     check("fk_region", !svc.fk_region.is_empty(), "Region is required");
-    check("fk_pod", !svc.fk_pod.is_empty(), "Compute pod is required");
+    // Either a catalogue pod or a custom size satisfies this: the API takes
+    // custom_pod in place of fk_pod and resolves the class itself.
+    check(
+        "fk_pod",
+        !svc.fk_pod.is_empty() || svc.custom_pod.is_some(),
+        "A size is required: set fk_pod, or custom_pod with vcpu_millicores and memory_mib",
+    );
+    // Both would be ambiguous — the API silently prefers custom_pod, so the
+    // named pod would be discarded without a word.
+    check(
+        "custom_pod",
+        svc.fk_pod.is_empty() || svc.custom_pod.is_none(),
+        "Set fk_pod OR custom_pod, not both",
+    );
+    check(
+        "replica_count",
+        svc.replica_count.is_none_or(|n| n >= 1),
+        "replica_count must be at least 1",
+    );
+    // Batch and database workloads are pinned to one pod server-side; catching
+    // it here turns a deploy-time rejection into a config error.
+    check(
+        "replica_count",
+        svc.replica_count
+            .is_none_or(|n| n == 1 || !matches!(svc.deploy_type.as_str(), "cronjob" | "database")),
+        "cronjob and database services always run a single replica",
+    );
     // check("fk_disk_pod", !svc.fk_disk_pod.is_empty(), "Disk pod is required");
 
     // Source: must have repository OR registry, not both, not neither
@@ -958,6 +1045,8 @@ mod tests {
             fk_workspace: "ws-uuid".to_string(),
             fk_project: "proj-uuid".to_string(),
             service: ServiceConfig {
+                custom_pod: None,
+                replica_count: None,
                 name: "my-service".to_string(),
                 deploy_type: "webservice".to_string(),
                 runtime: "node".to_string(),
@@ -1058,6 +1147,67 @@ mod tests {
         c.service.fk_pod = "".to_string();
         let r = validate_config(&c);
         assert!(!r.iter().find(|r| r.field == "fk_pod").unwrap().ok);
+    }
+
+    // A custom size satisfies the size requirement: the API takes custom_pod in
+    // place of fk_pod and resolves the class itself.
+    #[test]
+    fn custom_pod_without_fk_pod_passes() {
+        let mut c = valid_webservice();
+        c.service.fk_pod = String::new();
+        c.service.custom_pod = Some(CustomPodSpec {
+            vcpu_millicores: 1000,
+            memory_mib: 1024,
+        });
+        let r = validate_config(&c);
+        assert!(r.iter().find(|r| r.field == "fk_pod").unwrap().ok);
+        assert!(r.iter().find(|r| r.field == "custom_pod").unwrap().ok);
+    }
+
+    // Sending both is ambiguous: the API silently prefers custom_pod, so the
+    // named pod would be discarded without a word.
+    #[test]
+    fn fk_pod_and_custom_pod_together_fails() {
+        let mut c = valid_webservice();
+        c.service.custom_pod = Some(CustomPodSpec {
+            vcpu_millicores: 1000,
+            memory_mib: 1024,
+        });
+        let r = validate_config(&c);
+        assert!(!r.iter().find(|r| r.field == "custom_pod").unwrap().ok);
+    }
+
+    #[test]
+    fn replica_count_zero_fails() {
+        let mut c = valid_webservice();
+        c.service.replica_count = Some(0);
+        let r = validate_config(&c);
+        assert!(!r.iter().find(|r| r.field == "replica_count").unwrap().ok);
+    }
+
+    #[test]
+    fn replica_count_above_one_passes_for_a_webservice() {
+        let mut c = valid_webservice();
+        c.service.replica_count = Some(4);
+        let r = validate_config(&c);
+        assert!(r
+            .iter()
+            .filter(|r| r.field == "replica_count")
+            .all(|r| r.ok));
+    }
+
+    // Pinned server-side by a CHECK constraint; catching it here turns a
+    // deploy-time rejection into a config error the user can act on.
+    #[test]
+    fn multi_replica_cronjob_fails() {
+        let mut c = valid_webservice();
+        c.service.deploy_type = "cronjob".to_string();
+        c.service.replica_count = Some(3);
+        let r = validate_config(&c);
+        assert!(r
+            .iter()
+            .filter(|r| r.field == "replica_count")
+            .any(|r| !r.ok));
     }
 
     #[test]

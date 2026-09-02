@@ -292,6 +292,76 @@ where
     }
 }
 
+/// Print a tabular listing plus extra top-level envelope keys.
+///
+/// Same contract as [`print_table`] — `data` stays the row array, so existing
+/// consumers are unaffected — with `meta`'s fields merged in beside it. For
+/// listing-wide information that is not a property of any single row. A `meta`
+/// that is not a JSON object is ignored.
+///
+/// `schema_version` and `data` are written last and always win: a `meta` that
+/// happens to carry one of those names must not be able to overwrite the
+/// envelope out from under every consumer.
+pub fn print_table_with_meta<T, M>(rows: Vec<T>, meta: M)
+where
+    T: tabled::Tabled + Serialize,
+    M: Serialize,
+{
+    if ctx().json {
+        println!("{}", table_envelope(&rows, meta));
+    } else {
+        println!("{}", tabled::Table::new(rows));
+    }
+}
+
+/// Build the JSON envelope [`print_table_with_meta`] emits. Split out so the
+/// key precedence is testable without capturing stdout.
+fn table_envelope<T: Serialize, M: Serialize>(rows: &T, meta: M) -> serde_json::Value {
+    let mut env = serde_json::Map::new();
+    if let Ok(serde_json::Value::Object(extra)) = serde_json::to_value(meta) {
+        env.extend(extra);
+    }
+    env.insert("schema_version".to_string(), SCHEMA_VERSION.into());
+    env.insert(
+        "data".to_string(),
+        serde_json::to_value(rows).unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::Value::Object(env)
+}
+
+#[cfg(test)]
+mod table_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn meta_keys_sit_beside_data() {
+        let env = table_envelope(&vec![1, 2, 3], serde_json::json!({"custom_pod": {"a": 1}}));
+        assert_eq!(env["data"], serde_json::json!([1, 2, 3]));
+        assert_eq!(env["custom_pod"]["a"], 1);
+        assert_eq!(env["schema_version"], SCHEMA_VERSION);
+    }
+
+    // A meta that happens to carry an envelope key must not be able to replace
+    // it — every consumer reads `data` as the row array.
+    #[test]
+    fn envelope_keys_win_over_colliding_meta() {
+        let env = table_envelope(
+            &vec![1, 2, 3],
+            serde_json::json!({"data": "hijacked", "schema_version": "999"}),
+        );
+        assert_eq!(env["data"], serde_json::json!([1, 2, 3]));
+        assert_eq!(env["schema_version"], SCHEMA_VERSION);
+    }
+
+    // A non-object meta has no fields to merge; the envelope stands alone.
+    #[test]
+    fn non_object_meta_is_ignored() {
+        let env = table_envelope(&vec![1], serde_json::json!("not an object"));
+        assert_eq!(env["data"], serde_json::json!([1]));
+        assert_eq!(env.as_object().unwrap().len(), 2);
+    }
+}
+
 /// Print an informational line (cyan `→` prefix) to stdout. Suppressed entirely
 /// in JSON mode to keep the one-structured-result-per-invocation contract.
 pub fn print_info(msg: &str) {

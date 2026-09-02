@@ -104,6 +104,10 @@ pub struct Service {
     pub run_command: Option<String>,
     // Infrastructure
     pub fk_pod: Option<String>,
+    /// Pods run IN EACH region; `None` on an older API. Total pods is this
+    /// times the number of regional replicas.
+    #[serde(default)]
+    pub replica_count: Option<u32>,
     pub fk_project: Option<String>,
     pub fk_workspace: Option<String>,
     /// Regional replicas. Populated by `read_service`; absent on list endpoints.
@@ -326,6 +330,52 @@ pub struct PodPrice {
     #[serde(rename = "perMinute")]
     #[allow(dead_code)]
     pub per_minute: f64,
+}
+
+/// Per-region rate a custom-sized pod is priced at.
+#[derive(Debug, serde::Deserialize)]
+pub struct CustomPodRate {
+    /// Region UUID this rate applies to.
+    pub fk_region: String,
+    /// Monthly price per whole vCPU (EUR).
+    pub price_per_vcpu_month: f64,
+    /// Monthly price per GB of RAM (EUR).
+    pub price_per_gb_ram_month: f64,
+}
+
+/// Size range a custom pod may use, plus the rate it is priced at.
+/// Returned by `GET /resources/custom-pod?regions=…`.
+#[derive(Debug, serde::Deserialize)]
+pub struct CustomPodOptions {
+    /// `false` when custom pods cannot be offered for this region set — the
+    /// server would reject any size picked from it.
+    pub available: bool,
+    /// Smallest CPU allocation, in millicores.
+    pub min_millicores: Option<u32>,
+    /// Largest CPU allocation, in millicores.
+    pub max_millicores: Option<u32>,
+    /// CPU granularity; a value off this grid is rejected.
+    pub millicores_step: Option<u32>,
+    /// Smallest memory allocation, in MiB.
+    pub min_memory_mib: Option<u32>,
+    /// Largest memory allocation, in MiB.
+    pub max_memory_mib: Option<u32>,
+    /// Memory granularity; a value off this grid is rejected.
+    pub memory_mib_step: Option<u32>,
+    /// One entry per requested region.
+    pub rates: Vec<CustomPodRate>,
+}
+
+impl CustomPodOptions {
+    /// Monthly price for a size in one region, mirroring
+    /// `accounting.custom_pod_price()` on the server. `None` when the region
+    /// has no rate, so callers hide the figure rather than show a bogus zero.
+    pub fn price(&self, millicores: u32, memory_mib: u32, region_id: &str) -> Option<f64> {
+        let rate = self.rates.iter().find(|r| r.fk_region == region_id)?;
+        let value = (f64::from(millicores) / 1000.0) * rate.price_per_vcpu_month
+            + (f64::from(memory_mib) / 1024.0) * rate.price_per_gb_ram_month;
+        Some((value * 100.0).round() / 100.0)
+    }
 }
 
 /// Workspace balance, returned by `GET /balances/:workspace_id`.
@@ -1056,8 +1106,29 @@ impl ApiClient {
     // ─── Pricing & balance ────────────────────────────────────────────────────
 
     /// Fetch pod and volume pricing for a region (`GET /resources/pricing?region=…`).
-    pub fn get_pricing(&self, region_id: &str) -> Result<RegionPricing> {
-        self.get_query("/resources/pricing", &[("region", region_id)])
+    ///
+    /// The response covers CATALOGUE pods only. A custom-sized pod is absent
+    /// from it, so its id must be passed in `pod_ids` or the price lookups in
+    /// the cost estimates fall through to zero and quote a paid pod as free.
+    pub fn get_pricing(&self, region_id: &str, pod_ids: &[&str]) -> Result<RegionPricing> {
+        if pod_ids.is_empty() {
+            return self.get_query("/resources/pricing", &[("region", region_id)]);
+        }
+        let joined = pod_ids.join(",");
+        self.get_query(
+            "/resources/pricing",
+            &[("region", region_id), ("pods", joined.as_str())],
+        )
+    }
+
+    /// Fetch the size range and rate card for a custom-sized pod across a set
+    /// of regions (`GET /resources/custom-pod?regions=…`).
+    ///
+    /// One pod size covers every region a service runs in, so the offered range
+    /// is the intersection across all of them.
+    pub fn get_custom_pod_options(&self, region_ids: &[&str]) -> Result<CustomPodOptions> {
+        let joined = region_ids.join(",");
+        self.get_query("/resources/custom-pod", &[("regions", joined.as_str())])
     }
 
     /// Fetch the workspace balance (`GET /balances/:workspace_id`).
@@ -1920,7 +1991,7 @@ mod tests {
             }));
         });
 
-        let pricing = test_client(&server).get_pricing("reg-eu-1").unwrap();
+        let pricing = test_client(&server).get_pricing("reg-eu-1", &[]).unwrap();
 
         mock.assert();
         assert_eq!(pricing.pods.len(), 2);
@@ -1940,7 +2011,7 @@ mod tests {
             }));
         });
 
-        let pricing = test_client(&server).get_pricing("r").unwrap();
+        let pricing = test_client(&server).get_pricing("r", &[]).unwrap();
         assert!((pricing.pods[0].per_minute - 1.0).abs() < 1e-6);
     }
 

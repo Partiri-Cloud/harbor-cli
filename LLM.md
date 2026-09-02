@@ -72,6 +72,10 @@ Invariants worth knowing up front:
 - Private repo/registry sources require `fk_service_secret` (see §5).
 - `disk` is optional and pins the service to a single region (see §5).
 - Env vars are never stored in this file — manage them with `partiri service env`.
+- `fk_pod` XOR `custom_pod` — exactly one. Setting both is rejected locally,
+  because the API silently prefers `custom_pod` and would discard the named pod.
+- `replica_count` is per region (default 1), so total pods is `replica_count` ×
+  number of regions. It must be 1 for a cronjob.
 - `deploy_type: "cronjob"` requires `cronjob_active_deadline_seconds` (1–3600)
   and either `run_command` or `registry_url`.
 - `scheduler` is the cronjob discriminator — present → recurring CronJob, absent
@@ -353,7 +357,7 @@ Constraints the API enforces, all of them pre-checked by `partiri validate`:
 | Minimum interval | Runs must be ≥ 5 minutes apart. `* * * * *` and `*/4 * * * *` are rejected. |
 | Deadline | `cronjob_active_deadline_seconds` required, 1–3600. It sizes the per-run balance pre-authorization. |
 | Command | Needs `run_command` (repository source) or `registry_url` (image). |
-| Replicas | Always 1 — a cronjob is never scaled out. |
+| Replicas | Always 1. `replica_count` above 1 is rejected. |
 | Concurrency | `cronjob_concurrency_policy` ∈ `Allow` \| `Forbid` \| `Replace`. |
 | Timezone | UTC unless `cronjob_time_zone` is set to an IANA zone. |
 
@@ -398,7 +402,7 @@ partiri service env --path .env.partiri      # full-replace upload
 |---|---|
 | `partiri service create` | Estimated monthly cost (pod + disk) for the new service — except a cronjob, which is quoted per run (below) |
 | `partiri service push` | Signed monthly cost-delta: desired cost − current cost (e.g. `+€5.0000` or `-€2.0000`) |
-| `partiri pods list --region <UUID>` | Monthly price column (`€/month`) per pod |
+| `partiri pods list --region <UUID>` | Monthly price column (`€/month`) per pod, plus a `custom_pod` object with the allowed size range, step, and this region's rate |
 | `partiri llm context` | `price_eur_month` per pod and `volume_price_per_gb` for the workspace; `balance_eur` for each workspace |
 
 All amounts are in EUR. Cost estimates are non-fatal: if pricing is unavailable for a region the
@@ -409,6 +413,12 @@ field is `null` and the command still succeeds.
 configured `cronjob_active_deadline_seconds` — and leaves `monthly_cost_eur` null. Do not
 multiply it out as a monthly figure; the real spend depends on how long runs actually take
 and how often the schedule fires.
+
+**`replica_count` multiplies the monthly cost.** The quoted figure is per region and already
+accounts for it: total pods is `replica_count` × number of regions.
+
+**A custom pod resize is not quoted by `push`.** The new pod class does not exist until the
+push lands, so there is no id to price and the delta is omitted rather than invented.
 
 ### Balance preflight
 
@@ -476,7 +486,10 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **`cronjob_active_deadline_seconds` is required for every cronjob**, recurring or one-shot, and capped at 3600. It is the kill-timeout for a single run and the figure the per-run balance pre-authorization is sized against — not an optional tuning knob.
 - **Cron runs must be at least 5 minutes apart.** `* * * * *` is rejected. `validate` catches the common shapes locally, but the API's cron parser is authoritative: a minute field the CLI cannot expand is passed through, so a local pass is not a guarantee.
 - **A cronjob is billed per run, not per month.** `service create` returns `max_cost_per_run_eur` and leaves `monthly_cost_eur` null. Multiplying the pod's monthly price is the wrong model.
-- **A cronjob always runs one replica** and has no inbound network, so `health_check_path` does nothing.
+- **A cronjob always runs one replica** and has no inbound network, so `replica_count` above 1 is rejected and `health_check_path` does nothing.
+- **`fk_pod` and `custom_pod` are mutually exclusive.** The API silently prefers `custom_pod` when both arrive, discarding the named pod without a word — so the CLI rejects the pair at `validate`. Leave `fk_pod` empty when sizing a pod yourself.
+- **A custom pod size must sit on the step grid**, which only `partiri pods list --region <UUID>` publishes (as `custom_pod` in the `-j` envelope). A size off the grid is rejected at deploy time, not at create.
+- **`service pull` writes back a custom-sized service as its resolved `fk_pod`,** never as `custom_pod`. That id is a real, priced pod class; pushing it again re-mints nothing. `custom_pod` is only ever a request for a *new* size.
 
 ## 10. Glossary
 
@@ -484,7 +497,8 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **Project** — a logical grouping of services within a workspace, with an environment label (`dev`/`staging`/`prod`).
 - **Service** — the deployable unit. One service per `.partiri.jsonc` per directory.
 - **Region** — geographic location. Pods live in regions.
-- **Pod** — a sized compute slot (CPU + RAM + replicas). Pick a pod that matches your service's needs.
+- **Pod** — a sized compute slot (CPU + RAM). Pick a catalogue pod with `fk_pod`, or size one yourself with `custom_pod` (millicores + MiB, on the grid `pods list --region` reports). A custom pod requests equal limits, so what you ask for is what you are guaranteed and billed for.
+- **Replica** — one running copy of a service. `replica_count` is per region, so total pods is `replica_count` × number of regions, and so is the bill.
 - **Cronjob** — `deploy_type: "cronjob"`: a batch workload billed per run on actual duration. With `scheduler` set it is a recurring Kubernetes CronJob; without one it is a one-shot Job that runs once per deploy. Both need `cronjob_active_deadline_seconds`.
 - **deploy_tag** — the immutable tag of the most recent successful deploy. Used to fetch logs/metrics for that exact build.
 - **fk_*** — foreign-key fields in `.partiri.jsonc` pointing at other resources by UUID.
