@@ -563,6 +563,7 @@ mod tests {
                 maintenance_mode: false,
                 active: true,
                 env: None,
+                ..Default::default()
             },
         }
     }

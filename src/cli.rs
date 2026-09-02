@@ -458,7 +458,7 @@ pub enum LlmCommands {
     Schema,
     /// Print a pre-filled .partiri.jsonc template (does not write to disk).
     Template {
-        /// `webservice` (default), `static`, `private-service`, or `worker`.
+        /// `webservice` (default), `static`, `private-service`, `worker`, or `cronjob`.
         #[arg(long)]
         deploy_type: Option<String>,
         /// `node` (default), `rust`, `python`, … `registry`. See `llm schema`.

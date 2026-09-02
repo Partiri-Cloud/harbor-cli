@@ -109,6 +109,45 @@ pub struct Service {
     /// Regional replicas. Populated by `read_service`; absent on list endpoints.
     #[serde(default)]
     pub replicas: Option<Vec<ServiceReplica>>,
+
+    // ── Batch workloads (deploy_type "cronjob") ──────────────────────────
+    // Every one of these round-trips through `service pull`: without them the
+    // pulled config would declare `deploy_type: "cronjob"` with no schedule and
+    // no deadline, which `partiri validate` then rejects.
+    /// 5-field cron expression. Absent on a one-shot Job.
+    #[serde(default)]
+    pub scheduler: Option<String>,
+    /// IANA timezone the schedule is interpreted in.
+    #[serde(default)]
+    pub cronjob_time_zone: Option<String>,
+    /// Hard kill-timeout for a single run, in seconds.
+    #[serde(default)]
+    pub cronjob_active_deadline_seconds: Option<u32>,
+    /// Retries before a run is considered failed.
+    #[serde(default)]
+    pub cronjob_backoff_limit: Option<u32>,
+    /// Seconds a finished run's pod is kept before cleanup.
+    #[serde(default)]
+    pub cronjob_ttl_seconds_after_finished: Option<u32>,
+    /// "Allow" | "Forbid" | "Replace".
+    #[serde(default)]
+    pub cronjob_concurrency_policy: Option<String>,
+    /// Grace period for a missed schedule, in seconds.
+    #[serde(default)]
+    pub cronjob_starting_deadline_seconds: Option<u32>,
+    /// How many successful runs to keep in history.
+    #[serde(default)]
+    pub cronjob_successful_jobs_history_limit: Option<u32>,
+    /// How many failed runs to keep in history.
+    #[serde(default)]
+    pub cronjob_failed_jobs_history_limit: Option<u32>,
+    /// Whether the schedule is paused.
+    #[serde(default)]
+    pub cronjob_suspend: Option<bool>,
+    /// Container entrypoint override, as argv.
+    #[serde(default)]
+    pub cronjob_command: Option<Vec<String>>,
+
     // Health & settings
     pub health_check_path: Option<String>,
     pub maintenance_mode: Option<bool>,

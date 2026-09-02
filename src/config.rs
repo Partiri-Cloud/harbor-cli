@@ -72,7 +72,136 @@ pub fn config_flag_suffix() -> String {
 }
 
 /// Allowed values for [`ServiceConfig::deploy_type`].
-pub const DEPLOY_TYPES: &[&str] = &["webservice", "static", "private-service", "worker"];
+pub const DEPLOY_TYPES: &[&str] = &[
+    "webservice",
+    "static",
+    "private-service",
+    "worker",
+    "cronjob",
+];
+
+/// True when `expr` has exactly the five whitespace-separated fields a
+/// Kubernetes CronJob schedule needs (minute hour day-of-month month day-of-week).
+fn cron_field_count_ok(expr: &str) -> bool {
+    expr.split_whitespace().count() == 5
+}
+
+/// Every value in `0..=max` at which one comma-separated term of a cron field
+/// fires — `*`, `N`, `A-B`, and any of those with a `/step` suffix.
+///
+/// `None` means "not understood": an out-of-range value, a zero or malformed
+/// step, an inverted range, or anything more exotic. Callers treat that as a
+/// reason to defer to the API rather than to reject, since the server runs a
+/// real cron parser and will produce an accurate message.
+fn cron_term_values(term: &str, max: u32) -> Option<Vec<u32>> {
+    let term = term.trim();
+
+    // Split an optional `/step` suffix off the base expression.
+    let (base, step) = match term.split_once('/') {
+        Some((base, step)) => (base, Some(step.parse::<u32>().ok().filter(|n| *n > 0)?)),
+        None => (term, None),
+    };
+
+    // The base is a wildcard, a range, or a single value. Cron reads a bare
+    // `N/S` as `N-max/S` — "from N onwards, every S" — not as the single value N.
+    let (lo, hi) = if base == "*" {
+        (0, max)
+    } else if let Some((from, to)) = base.split_once('-') {
+        let (from, to) = (from.parse::<u32>().ok()?, to.parse::<u32>().ok()?);
+        if from > to {
+            return None;
+        }
+        (from, to)
+    } else {
+        let value = base.parse::<u32>().ok()?;
+        if step.is_some() {
+            (value, max)
+        } else {
+            (value, value)
+        }
+    };
+    if lo > max || hi > max {
+        return None;
+    }
+
+    Some((lo..=hi).step_by(step.unwrap_or(1) as usize).collect())
+}
+
+/// Expand a whole cron field (a comma-separated list of terms) into the sorted,
+/// deduplicated set of values it fires at. `None` if any term is not understood.
+fn cron_field_values(field: &str, max: u32) -> Option<Vec<u32>> {
+    let mut values = Vec::new();
+    for term in field.split(',') {
+        values.extend(cron_term_values(term, max)?);
+    }
+    values.sort_unstable();
+    values.dedup();
+    Some(values)
+}
+
+/// True when the HOUR field admits two hours exactly an hour apart (including
+/// the 23 → 0 wrap), which is what makes a wrap-around minute gap reachable.
+///
+/// An hour field this cannot expand reports false, so the wrap is skipped
+/// rather than guessed at — the lenient direction.
+fn cron_hours_can_be_consecutive(field: &str) -> bool {
+    let Some(hours) = cron_field_values(field, 23) else {
+        return false;
+    };
+    hours
+        .iter()
+        .any(|h| hours.binary_search(&((h + 1) % 24)).is_ok())
+}
+
+/// Best-effort check that a schedule does not fire more often than
+/// [`MIN_CRON_INTERVAL_MINUTES`], from the MINUTE and HOUR fields.
+///
+/// Expands the minute field and takes the tightest gap between fires. Gaps
+/// inside one hour always count: if the hour fires at all, every one of those
+/// minutes fires in it. The wrap from the last fire of one hour to the first of
+/// the next only counts when the hour field admits two consecutive hours —
+/// `0,58 0 * * *` runs once a day at 00:00 and 00:58, so its tight gap is 58
+/// minutes, not the 2 an unconditional wrap would compute.
+///
+/// Errs toward PASSING: a field this cannot expand defers to the API rather
+/// than failing here. A false PASS costs a 400 with an accurate message; a
+/// false FAIL would block a schedule the server would have accepted.
+fn cron_min_interval_ok(expr: &str) -> bool {
+    let mut fields = expr.split_whitespace();
+    let Some(minute_field) = fields.next() else {
+        return true;
+    };
+    let hour_field = fields.next();
+
+    let Some(minutes) = cron_field_values(minute_field, 59) else {
+        return true;
+    };
+    if minutes.is_empty() {
+        return true;
+    }
+
+    let mut min_gap = u32::MAX;
+    for pair in minutes.windows(2) {
+        min_gap = min_gap.min(pair[1] - pair[0]);
+    }
+
+    // Every entry is <= 59, so the wrap-around gap cannot underflow.
+    if hour_field.is_some_and(cron_hours_can_be_consecutive) {
+        min_gap = min_gap.min(60 - minutes[minutes.len() - 1] + minutes[0]);
+    }
+
+    // Nothing comparable: a single fire whose hour never repeats back-to-back.
+    min_gap == u32::MAX || min_gap >= MIN_CRON_INTERVAL_MINUTES
+}
+
+/// Allowed values for [`ServiceConfig::cronjob_concurrency_policy`].
+pub const CRONJOB_CONCURRENCY_POLICIES: &[&str] = &["Allow", "Forbid", "Replace"];
+
+/// Upper bound the API enforces on `cronjob_active_deadline_seconds`.
+pub const MAX_CRONJOB_DEADLINE_SECONDS: u32 = 60 * 60;
+
+/// Shortest gap the API allows between two consecutive cron fires.
+pub const MIN_CRON_INTERVAL_MINUTES: u32 = 5;
 
 /// Allowed values for [`ServiceConfig::runtime`].
 pub const RUNTIMES: &[&str] = &[
@@ -110,7 +239,10 @@ pub struct PartiriConfig {
 pub struct ServiceConfig {
     /// Service name. Must be ≤16 characters and unique within the project.
     pub name: String,
-    /// webservice | static | private-service | worker
+    /// webservice | static | private-service | worker | cronjob
+    ///
+    /// Managed databases are not configured here — create one with
+    /// `partiri db create`.
     pub deploy_type: String,
     /// node | deno | rust | python | go | ruby | elixir | php | jvm | dotnet | cpp | static | registry
     pub runtime: String,
@@ -154,6 +286,48 @@ pub struct ServiceConfig {
     /// Compute pod UUID — determines the CPU/RAM tier.
     pub fk_pod: String,
     // pub fk_disk_pod: String,
+
+    // ── Batch workloads (deploy_type "cronjob") ──────────────────────────
+    // `scheduler` is the discriminator: set it and the service renders as a
+    // Kubernetes CronJob, leave it out and it is a one-shot Job. The cron-only
+    // fields below are ignored when it is absent.
+    /// 5-field cron expression. Absent means a one-shot Job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<String>,
+    /// IANA timezone the schedule is interpreted in, e.g. "Europe/Lisbon".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_time_zone: Option<String>,
+    /// Hard kill-timeout for a single run, in seconds. REQUIRED for a cronjob:
+    /// it is what the balance pre-authorization is sized against, since runs
+    /// are billed per minute of actual duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_active_deadline_seconds: Option<u32>,
+    /// Retries before a run is considered failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_backoff_limit: Option<u32>,
+    /// Seconds a finished run's pod is kept before cleanup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_ttl_seconds_after_finished: Option<u32>,
+    /// What to do when a run is still going as the next one is due:
+    /// "Allow" | "Forbid" | "Replace".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_concurrency_policy: Option<String>,
+    /// Grace period for a missed schedule, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_starting_deadline_seconds: Option<u32>,
+    /// How many successful runs to keep in history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_successful_jobs_history_limit: Option<u32>,
+    /// How many failed runs to keep in history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_failed_jobs_history_limit: Option<u32>,
+    /// Pause the schedule without deleting the service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_suspend: Option<bool>,
+    /// Container entrypoint override, as argv.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cronjob_command: Option<Vec<String>>,
+
     /// Health-check path or absolute URL. `None` disables the check.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_path: Option<String>,
@@ -372,6 +546,91 @@ impl PartiriConfig {
                 .to_string(),
         };
 
+        // Written only for a cronjob: every other deploy type ignores these, and
+        // a block of eleven inert keys in every config would be noise.
+        let cronjob_section = if svc.deploy_type == "cronjob" {
+            let mut out = String::new();
+            out.push_str(
+                "\n    // Batch workload. \"scheduler\" is the discriminator: set it and\n    // this runs as a recurring CronJob; omit it for a one-shot Job.",
+            );
+            match &svc.scheduler {
+                Some(sched) => out.push_str(&format!("\n    \"scheduler\": {},", json_str(sched))),
+                None => out.push_str(
+                    "\n    // \"scheduler\": \"0 3 * * *\",   // daily at 03:00; min 5 minutes between runs",
+                ),
+            }
+            match &svc.cronjob_time_zone {
+                Some(tz) => {
+                    out.push_str(&format!("\n    \"cronjob_time_zone\": {},", json_str(tz)))
+                }
+                None => out.push_str("\n    // \"cronjob_time_zone\": \"Europe/Lisbon\","),
+            }
+            out.push_str(&format!(
+                "\n    // Hard kill-timeout for one run, in seconds (1-{}). Required:\n    // runs are billed per minute of actual duration, so this bounds\n    // the worst case a single run can cost.\n    \"cronjob_active_deadline_seconds\": {},",
+                MAX_CRONJOB_DEADLINE_SECONDS,
+                svc.cronjob_active_deadline_seconds.unwrap_or(300)
+            ));
+            // Example values are per-field on purpose: a TTL and a retry count
+            // are not the same order of magnitude, and a copied-in placeholder
+            // that is wrong for the field is worse than no example.
+            for (key, value, example) in [
+                ("cronjob_backoff_limit", svc.cronjob_backoff_limit, "3"),
+                (
+                    "cronjob_ttl_seconds_after_finished",
+                    svc.cronjob_ttl_seconds_after_finished,
+                    "3600",
+                ),
+                (
+                    "cronjob_starting_deadline_seconds",
+                    svc.cronjob_starting_deadline_seconds,
+                    "120",
+                ),
+                (
+                    "cronjob_successful_jobs_history_limit",
+                    svc.cronjob_successful_jobs_history_limit,
+                    "3",
+                ),
+                (
+                    "cronjob_failed_jobs_history_limit",
+                    svc.cronjob_failed_jobs_history_limit,
+                    "1",
+                ),
+            ] {
+                match value {
+                    Some(v) => out.push_str(&format!("\n    \"{}\": {},", key, v)),
+                    None => out.push_str(&format!("\n    // \"{}\": {},", key, example)),
+                }
+            }
+            match &svc.cronjob_concurrency_policy {
+                Some(policy) => out.push_str(&format!(
+                    "\n    \"cronjob_concurrency_policy\": {},",
+                    json_str(policy)
+                )),
+                None => out.push_str(
+                    "\n    // \"cronjob_concurrency_policy\": \"Forbid\",  // Allow | Forbid | Replace",
+                ),
+            }
+            match svc.cronjob_suspend {
+                Some(v) => out.push_str(&format!("\n    \"cronjob_suspend\": {},", v)),
+                None => {
+                    out.push_str("\n    // \"cronjob_suspend\": false,   // pause the schedule")
+                }
+            }
+            match &svc.cronjob_command {
+                Some(cmd) => out.push_str(&format!(
+                    "\n    \"cronjob_command\": [{}],",
+                    cmd.iter()
+                        .map(|c| json_str(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+                None => out.push_str("\n    // \"cronjob_command\": [\"node\", \"job.js\"],"),
+            }
+            out
+        } else {
+            String::new()
+        };
+
         let disk_section = match &svc.disk {
             Some(d) => format!(
                 r#"
@@ -411,11 +670,13 @@ impl PartiriConfig {
     // Display name for your service on Partiri Cloud.
     "name": {},
 
-    // Service type. Supported values: "webservice" | "static" | "private-service" | "worker"
+    // Service type. Supported values: "webservice" | "static" | "private-service" | "worker" | "cronjob"
     // - webservice:      public HTTP service with an external URL
     // - static:          static file hosting (repository only — registry not supported)
     // - private-service: internal HTTP service, not publicly accessible
     // - worker:          long-running background process with no inbound network
+    // - cronjob:         scheduled or one-shot batch run, billed per run
+    // Managed databases are not configured here — use 'partiri db create'.
     "deploy_type": {},
 
     // Runtime environment. Supported: "node" | "deno" | "rust" | "python" | "go" | "ruby" | "elixir" | "php" | "jvm" | "dotnet" | "cpp" | "static" | "registry"
@@ -440,6 +701,7 @@ impl PartiriConfig {
 
     // Compute pod — determines CPU and RAM allocated to the service.
     "fk_pod": {},
+{}
 
 {}
 {}
@@ -471,6 +733,7 @@ impl PartiriConfig {
             json_opt_str(&svc.run_command),
             json_str(&svc.fk_region),
             json_str(&svc.fk_pod),
+            cronjob_section,
             health_section,
             disk_section,
             svc.maintenance_mode,
@@ -610,6 +873,74 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
         }
     }
 
+    // ── Cronjob ─────────────────────────────────────────────────────────
+    // Mirrors the API's own checks so a bad schedule is caught here rather than
+    // as a 400 halfway through a create. The API stays authoritative: its cron
+    // parser computes the real minimum gap between fires, which this cannot do
+    // without a cron dependency.
+    if svc.deploy_type == "cronjob" {
+        // Required, and bounded: it is what the per-run balance
+        // pre-authorization is sized against, since a run is billed per minute
+        // of actual duration.
+        check(
+            "cronjob_active_deadline_seconds",
+            svc.cronjob_active_deadline_seconds
+                .is_some_and(|d| d > 0 && d <= MAX_CRONJOB_DEADLINE_SECONDS),
+            &format!(
+                "cronjob_active_deadline_seconds is required and must be between 1 and {}",
+                MAX_CRONJOB_DEADLINE_SECONDS
+            ),
+        );
+
+        let has_run = svc
+            .run_command
+            .as_ref()
+            .is_some_and(|c| !c.trim().is_empty());
+        let has_registry = svc
+            .registry_url
+            .as_ref()
+            .is_some_and(|u| !u.trim().is_empty());
+        check(
+            "run_command",
+            has_run || has_registry,
+            "cronjob services require run_command or registry_url",
+        );
+
+        if let Some(policy) = &svc.cronjob_concurrency_policy {
+            check(
+                "cronjob_concurrency_policy",
+                CRONJOB_CONCURRENCY_POLICIES.contains(&policy.as_str()),
+                &format!("Must be: {}", CRONJOB_CONCURRENCY_POLICIES.join(" | ")),
+            );
+        }
+
+        // Only a RECURRING cronjob has a schedule; without one it is a one-shot
+        // Job and the cron-only fields are inert.
+        if let Some(expr) = svc.scheduler.as_ref().filter(|s| !s.trim().is_empty()) {
+            check(
+                "scheduler",
+                cron_field_count_ok(expr),
+                "scheduler must be a 5-field cron expression, e.g. '0 3 * * *'",
+            );
+            check(
+                "scheduler",
+                cron_min_interval_ok(expr),
+                &format!(
+                    "scheduler must not fire more often than every {} minutes",
+                    MIN_CRON_INTERVAL_MINUTES
+                ),
+            );
+        }
+    } else {
+        // Cron-only fields on a non-cronjob service are silently ignored by the
+        // API, which reads as "it worked" until the schedule never fires.
+        check(
+            "scheduler",
+            svc.scheduler.is_none(),
+            "scheduler only applies to deploy_type \"cronjob\"",
+        );
+    }
+
     results
 }
 
@@ -646,6 +977,7 @@ mod tests {
                 maintenance_mode: false,
                 active: true,
                 env: None,
+                ..Default::default()
             },
         }
     }
@@ -731,9 +1063,246 @@ mod tests {
     #[test]
     fn invalid_deploy_type_fails() {
         let mut c = valid_webservice();
-        c.service.deploy_type = "cronjob".to_string();
+        c.service.deploy_type = "not-a-real-type".to_string();
         let r = validate_config(&c);
         assert!(!r.iter().find(|r| r.field == "deploy_type").unwrap().ok);
+    }
+
+    fn valid_cronjob() -> PartiriConfig {
+        let mut c = valid_webservice();
+        c.service.deploy_type = "cronjob".to_string();
+        c.service.cronjob_active_deadline_seconds = Some(300);
+        c
+    }
+
+    fn field_ok(r: &[ValidationResult], field: &str) -> bool {
+        r.iter().filter(|x| x.field == field).all(|x| x.ok)
+    }
+
+    // The deadline sizes the per-run balance pre-authorization, so the API
+    // refuses a cronjob without one.
+    #[test]
+    fn cronjob_without_deadline_fails() {
+        let mut c = valid_cronjob();
+        c.service.cronjob_active_deadline_seconds = None;
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "cronjob_active_deadline_seconds"));
+    }
+
+    #[test]
+    fn cronjob_deadline_above_the_cap_fails() {
+        let mut c = valid_cronjob();
+        c.service.cronjob_active_deadline_seconds = Some(MAX_CRONJOB_DEADLINE_SECONDS + 1);
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "cronjob_active_deadline_seconds"));
+    }
+
+    #[test]
+    fn cronjob_needs_a_run_command_or_registry() {
+        let mut c = valid_cronjob();
+        c.service.run_command = None;
+        c.service.registry_url = None;
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "run_command"));
+    }
+
+    // A schedule under the floor is rejected server-side; catching the obvious
+    // shapes here turns a 400 into a config error.
+    #[test]
+    fn cron_schedules_below_the_floor_are_rejected() {
+        for expr in ["* * * * *", "*/1 * * * *", "*/4 * * * *", "0-30 * * * *"] {
+            let mut c = valid_cronjob();
+            c.service.scheduler = Some(expr.to_string());
+            let r = validate_config(&c);
+            assert!(!field_ok(&r, "scheduler"), "{expr} should be rejected");
+        }
+    }
+
+    #[test]
+    fn cron_schedules_at_or_above_the_floor_are_accepted() {
+        for expr in [
+            "*/5 * * * *",
+            "0 3 * * *",
+            "0,30 * * * *",
+            "0,15,30,45 * * * *",
+            // A stepped range is how "every 10 minutes" is often written, and
+            // its gap is the step, not one minute.
+            "0-59/10 * * * *",
+            "0-30/15 * * * *",
+            // Cron reads a bare `N/S` as `N-59/S`, so this fires every 10
+            // minutes from :05 — not once at :05.
+            "5/10 * * * *",
+            // A range narrow enough to fire once an hour.
+            "0-3/10 * * * *",
+        ] {
+            let mut c = valid_cronjob();
+            c.service.scheduler = Some(expr.to_string());
+            let r = validate_config(&c);
+            assert!(field_ok(&r, "scheduler"), "{expr} should be accepted");
+        }
+    }
+
+    // The gap from the last entry back to the first crosses the hour, and when
+    // the hour field fires every hour it is just as real as the gaps between
+    // listed minutes.
+    #[test]
+    fn cron_list_wrap_around_gap_is_checked() {
+        for expr in [
+            "0,58 * * * *",
+            "0-59/58 * * * *",
+            // Consecutive hours reach the wrap the same way `*` does.
+            "0,58 0,1 * * *",
+            // 23 -> 0 is consecutive too.
+            "0,58 23,0 * * *",
+        ] {
+            let mut c = valid_cronjob();
+            c.service.scheduler = Some(expr.to_string());
+            let r = validate_config(&c);
+            assert!(!field_ok(&r, "scheduler"), "{expr} should be rejected");
+        }
+    }
+
+    // ...but the wrap is only reachable if two consecutive hours can both fire.
+    // `0,58 0 * * *` runs once a day, at 00:00 and 00:58: the tight gap is 58
+    // minutes, and rejecting it would block a schedule the API accepts.
+    #[test]
+    fn cron_wrap_around_is_ignored_when_the_hour_never_repeats() {
+        for expr in [
+            "0,58 0 * * *",
+            "0,58 3 * * *",
+            // Every other hour: 00:58 -> 02:00 is 62 minutes, not 2.
+            "0,58 */2 * * *",
+            "0,58 0,12 * * *",
+        ] {
+            let mut c = valid_cronjob();
+            c.service.scheduler = Some(expr.to_string());
+            let r = validate_config(&c);
+            assert!(field_ok(&r, "scheduler"), "{expr} should be accepted");
+        }
+    }
+
+    // Gaps within a single hour are real no matter how rarely the hour fires.
+    #[test]
+    fn cron_within_hour_gaps_count_even_for_a_yearly_schedule() {
+        let mut c = valid_cronjob();
+        c.service.scheduler = Some("0,1 0 1 1 *".to_string());
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "scheduler"));
+    }
+
+    // A minute outside 0..=59 is a syntax error the API's cron parser reports
+    // precisely. Expanding it here once underflowed the wrap-around gap, which
+    // panicked a debug build on nothing worse than a typo.
+    #[test]
+    fn cron_minutes_outside_the_hour_do_not_panic() {
+        for expr in [
+            "0,90 * * * *",
+            "60-90 * * * *",
+            "*/0 * * * *",
+            "9-2 * * * *",
+        ] {
+            let mut c = valid_cronjob();
+            c.service.scheduler = Some(expr.to_string());
+            let r = validate_config(&c);
+            // Deferred, not rejected: a local "fires too often" message would
+            // be wrong, and the API explains the real problem.
+            assert!(field_ok(&r, "scheduler"), "{expr} should defer to the API");
+        }
+    }
+
+    #[test]
+    fn cron_expression_must_have_five_fields() {
+        let mut c = valid_cronjob();
+        c.service.scheduler = Some("0 3 * *".to_string());
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "scheduler"));
+    }
+
+    #[test]
+    fn cronjob_concurrency_policy_is_constrained() {
+        let mut c = valid_cronjob();
+        c.service.cronjob_concurrency_policy = Some("Sometimes".to_string());
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "cronjob_concurrency_policy"));
+
+        c.service.cronjob_concurrency_policy = Some("Forbid".to_string());
+        let r = validate_config(&c);
+        assert!(field_ok(&r, "cronjob_concurrency_policy"));
+    }
+
+    // The API ignores a schedule on anything but a cronjob, which reads as
+    // "it worked" until the user notices it never fires.
+    #[test]
+    fn scheduler_on_a_non_cronjob_fails() {
+        let mut c = valid_webservice();
+        c.service.scheduler = Some("0 3 * * *".to_string());
+        let r = validate_config(&c);
+        assert!(!field_ok(&r, "scheduler"));
+    }
+
+    // A one-shot Job has no schedule; the cron-only fields are simply inert.
+    #[test]
+    fn cronjob_without_a_schedule_is_a_valid_one_shot_job() {
+        let c = valid_cronjob();
+        let r = validate_config(&c);
+        assert!(
+            r.iter().all(|x| x.ok),
+            "{:?}",
+            r.iter().filter(|x| !x.ok).collect::<Vec<_>>()
+        );
+    }
+
+    // The config file is the CLI's whole interface, so a cronjob that cannot
+    // survive a write/read cycle is not actually supported.
+    #[test]
+    fn cronjob_round_trips_through_the_config_file() {
+        let mut c = valid_cronjob();
+        c.service.scheduler = Some("0 3 * * *".to_string());
+        c.service.cronjob_time_zone = Some("Europe/Lisbon".to_string());
+        c.service.cronjob_concurrency_policy = Some("Forbid".to_string());
+        c.service.cronjob_backoff_limit = Some(2);
+        c.service.cronjob_suspend = Some(false);
+        c.service.cronjob_command = Some(vec!["node".into(), "job.js".into()]);
+
+        let text = c.to_jsonc_string().unwrap();
+        let parsed: PartiriConfig = json5::from_str(&text).expect("config must re-parse");
+
+        assert_eq!(parsed.service.deploy_type, "cronjob");
+        assert_eq!(parsed.service.scheduler.as_deref(), Some("0 3 * * *"));
+        assert_eq!(parsed.service.cronjob_active_deadline_seconds, Some(300));
+        assert_eq!(
+            parsed.service.cronjob_time_zone.as_deref(),
+            Some("Europe/Lisbon")
+        );
+        assert_eq!(
+            parsed.service.cronjob_concurrency_policy.as_deref(),
+            Some("Forbid")
+        );
+        assert_eq!(parsed.service.cronjob_backoff_limit, Some(2));
+        assert_eq!(parsed.service.cronjob_suspend, Some(false));
+        assert_eq!(
+            parsed.service.cronjob_command,
+            Some(vec!["node".to_string(), "job.js".to_string()])
+        );
+    }
+
+    // A webservice config must not sprout eleven inert cronjob keys.
+    #[test]
+    fn non_cronjob_config_has_no_cronjob_keys() {
+        let text = valid_webservice().to_jsonc_string().unwrap();
+        let parsed: serde_json::Value = json5::from_str(&text).unwrap();
+        let svc = parsed["service"].as_object().unwrap();
+        assert!(svc.keys().all(|k| !k.starts_with("cronjob_")));
+        assert!(!svc.contains_key("scheduler"));
+    }
+
+    #[test]
+    fn cronjob_deploy_type_is_accepted() {
+        let mut c = valid_webservice();
+        c.service.deploy_type = "cronjob".to_string();
+        c.service.cronjob_active_deadline_seconds = Some(300);
+        let r = validate_config(&c);
+        assert!(r.iter().find(|r| r.field == "deploy_type").unwrap().ok);
     }
 
     #[test]
@@ -962,6 +1531,48 @@ mod tests {
     // ─── Property-based tests ─────────────────────────────────────────────────
 
     proptest! {
+        // The schedule comes straight from a hand-edited config file, so every
+        // shape of garbage reaches the expander. It once underflowed the
+        // wrap-around gap on a minute above 59 and panicked the whole CLI.
+        #[test]
+        fn cron_min_interval_ok_never_panics(expr in ".*") {
+            let _ = cron_min_interval_ok(&expr);
+        }
+
+        // Same, driven through the public entry point with a cronjob config.
+        #[test]
+        fn validate_config_never_panics_on_any_schedule(scheduler in ".*") {
+            let mut c = valid_webservice();
+            c.service.deploy_type = "cronjob".to_string();
+            c.service.cronjob_active_deadline_seconds = Some(300);
+            c.service.scheduler = Some(scheduler);
+            let _ = validate_config(&c);
+        }
+
+        // A minute field built only from in-range parts always expands, so the
+        // check must reach a real verdict rather than deferring.
+        #[test]
+        fn in_range_minute_lists_are_always_decided(
+            minutes in proptest::collection::vec(0u32..60, 1..8)
+        ) {
+            let list = minutes.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            let expr = format!("{list} * * * *");
+
+            let mut sorted = minutes.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let expected = if sorted.len() < 2 {
+                true
+            } else {
+                let mut min_gap = 60 - sorted[sorted.len() - 1] + sorted[0];
+                for pair in sorted.windows(2) {
+                    min_gap = min_gap.min(pair[1] - pair[0]);
+                }
+                min_gap >= MIN_CRON_INTERVAL_MINUTES
+            };
+            prop_assert_eq!(cron_min_interval_ok(&expr), expected);
+        }
+
         #[test]
         fn validate_config_never_panics(
             name in ".*",
