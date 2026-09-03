@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn index_covers_all_three_levels() {
         let idx = SchemaIndex::build();
-        assert!(idx.root.contains_key("fk_workspace"));
+        assert!(idx.root.contains_key("workspace"));
         assert!(idx.service.contains_key("runtime"));
         assert!(idx.disk.contains_key("mount_path"));
     }

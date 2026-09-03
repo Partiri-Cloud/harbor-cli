@@ -30,7 +30,7 @@ fn refresh_existing(client: &ApiClient, existing: &PartiriConfig) -> Result<Part
 
     let mut refreshed = existing.clone();
     apply_live_pod(&mut refreshed, service.fk_pod.as_deref());
-    let fetched = fetch_service_disk(client, &refreshed.fk_project, id);
+    let fetched = fetch_service_disk(client, &refreshed.project, id);
     apply_live_disk(&mut refreshed, fetched);
     refreshed.save()?;
     Ok(refreshed)
@@ -52,20 +52,20 @@ fn apply_live_pod(config: &mut PartiriConfig, live: Option<&str>) {
     let Some(live) = live.map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
-    if config.service.fk_pod == live {
+    if config.service.pod == live {
         return;
     }
     // An empty local value is a config being filled in, not a divergence.
-    if !config.service.fk_pod.is_empty() && !crate::output::ctx().json {
+    if !config.service.pod.is_empty() && !crate::output::ctx().json {
         eprintln!(
             "  {} compute pod '{}' adopted from the API, replacing local '{}'; \
              the next 'partiri service push' would otherwise have reverted it.",
             "warn:".yellow(),
             live,
-            config.service.fk_pod,
+            config.service.pod,
         );
     }
-    config.service.fk_pod = live.to_string();
+    config.service.pod = live.to_string();
 }
 
 /// Fold the live volume's disk state into `config.service.disk` without ever
@@ -147,7 +147,7 @@ pub fn run_by_id(client: &ApiClient, service_id: &str) -> Result<()> {
     let fk_project = service.fk_project.clone().unwrap_or_default();
     let mut config = map_to_config(service, service_id.to_string(), fk_workspace, fk_project)?;
 
-    if config.fk_workspace.is_empty() || config.fk_project.is_empty() {
+    if config.workspace.is_empty() || config.project.is_empty() {
         return Err(Box::new(
             CliError::new(
                 "validation",
@@ -162,7 +162,7 @@ pub fn run_by_id(client: &ApiClient, service_id: &str) -> Result<()> {
     // project UUID is valid. This is a fresh config (no local disk block to
     // preserve), so `Ok(None)` simply leaves it unset and a listing error warns
     // rather than aborting the write.
-    let fetched = fetch_service_disk(client, &config.fk_project, service_id);
+    let fetched = fetch_service_disk(client, &config.project, service_id);
     apply_live_disk(&mut config, fetched);
 
     config.save()?;
@@ -402,15 +402,15 @@ pub(crate) fn map_to_config(
     fk_workspace: String,
     fk_project: String,
 ) -> Result<PartiriConfig> {
-    let fk_region = svc
+    let region = svc
         .primary_region()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or("Pulled service is missing a primary region replica")?;
     Ok(PartiriConfig {
         id: Some(id),
-        fk_workspace: svc.fk_workspace.unwrap_or(fk_workspace),
-        fk_project: svc.fk_project.unwrap_or(fk_project),
+        workspace: svc.fk_workspace.unwrap_or(fk_workspace),
+        project: svc.fk_project.unwrap_or(fk_project),
         service: ServiceConfig {
             name: svc.name,
             deploy_type: svc.deploy_type,
@@ -419,13 +419,13 @@ pub(crate) fn map_to_config(
             repository_url: non_empty(svc.repository_url),
             repository_branch: non_empty(svc.repository_branch),
             registry_url: non_empty(svc.registry_url),
-            fk_service_secret: non_empty(svc.fk_service_secret),
+            service_secret: non_empty(svc.fk_service_secret),
             build_path: non_empty(svc.build_path),
             build_command: non_empty(svc.build_command),
             pre_deploy_command: non_empty(svc.pre_deploy_command),
             run_command: non_empty(svc.run_command),
-            fk_region,
-            fk_pod: svc
+            region,
+            pod: svc
                 .fk_pod
                 .filter(|s| !s.is_empty())
                 .ok_or("Pulled service is missing fk_pod")?,
@@ -571,8 +571,8 @@ mod apply_live_disk_tests {
     fn cfg(disk: Option<DiskConfig>) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".to_string()),
-            fk_workspace: "ws-1".to_string(),
-            fk_project: "proj-1".to_string(),
+            workspace: "ws-1".to_string(),
+            project: "proj-1".to_string(),
             service: ServiceConfig {
                 name: "svc".to_string(),
                 deploy_type: "webservice".to_string(),
@@ -581,13 +581,13 @@ mod apply_live_disk_tests {
                 repository_url: None,
                 repository_branch: None,
                 registry_url: None,
-                fk_service_secret: None,
+                service_secret: None,
                 build_path: None,
                 build_command: Some("npm run build".to_string()),
                 pre_deploy_command: None,
                 run_command: None,
-                fk_region: "region-1".to_string(),
-                fk_pod: "pod-1".to_string(),
+                region: "region-1".to_string(),
+                pod: "pod-1".to_string(),
                 health_check_path: None,
                 disk,
                 maintenance_mode: false,
@@ -752,13 +752,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.id, Some("svc-123".to_string()));
-        assert_eq!(config.fk_workspace, "ws-1");
-        assert_eq!(config.fk_project, "proj-1");
+        assert_eq!(config.workspace, "ws-1");
+        assert_eq!(config.project, "proj-1");
         assert_eq!(config.service.name, "my-service");
         assert_eq!(config.service.deploy_type, "webservice");
         assert_eq!(config.service.runtime, "node");
-        assert_eq!(config.service.fk_region, "region-uuid");
-        assert_eq!(config.service.fk_pod, "pod-uuid");
+        assert_eq!(config.service.region, "region-uuid");
+        assert_eq!(config.service.pod, "pod-uuid");
         assert_eq!(
             config.service.repository_url.as_deref(),
             Some("https://github.com/org/repo")
@@ -1053,8 +1053,8 @@ mod overwrite_guard_tests {
     fn cfg_with_id(id: &str) -> PartiriConfig {
         PartiriConfig {
             id: Some(id.to_string()),
-            fk_workspace: "ws-1".to_string(),
-            fk_project: "proj-1".to_string(),
+            workspace: "ws-1".to_string(),
+            project: "proj-1".to_string(),
             service: ServiceConfig {
                 name: "svc".to_string(),
                 deploy_type: "webservice".to_string(),
@@ -1063,13 +1063,13 @@ mod overwrite_guard_tests {
                 repository_url: None,
                 repository_branch: None,
                 registry_url: None,
-                fk_service_secret: None,
+                service_secret: None,
                 build_path: None,
                 build_command: None,
                 pre_deploy_command: None,
                 run_command: None,
-                fk_region: "region-1".to_string(),
-                fk_pod: "pod-1".to_string(),
+                region: "region-1".to_string(),
+                pod: "pod-1".to_string(),
                 health_check_path: None,
                 disk: None,
                 maintenance_mode: false,
@@ -1136,8 +1136,8 @@ mod apply_live_pod_tests {
     fn cfg(fk_pod: &str) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".to_string()),
-            fk_workspace: "ws-1".to_string(),
-            fk_project: "proj-1".to_string(),
+            workspace: "ws-1".to_string(),
+            project: "proj-1".to_string(),
             service: ServiceConfig {
                 name: "svc".to_string(),
                 deploy_type: "webservice".to_string(),
@@ -1146,13 +1146,13 @@ mod apply_live_pod_tests {
                 repository_url: None,
                 repository_branch: None,
                 registry_url: None,
-                fk_service_secret: None,
+                service_secret: None,
                 build_path: None,
                 build_command: None,
                 pre_deploy_command: None,
                 run_command: None,
-                fk_region: "region-1".to_string(),
-                fk_pod: fk_pod.to_string(),
+                region: "region-1".to_string(),
+                pod: fk_pod.to_string(),
                 health_check_path: None,
                 disk: None,
                 maintenance_mode: false,
@@ -1170,14 +1170,14 @@ mod apply_live_pod_tests {
         // size.
         let mut config = cfg("pod-a");
         apply_live_pod(&mut config, Some("pod-b"));
-        assert_eq!(config.service.fk_pod, "pod-b");
+        assert_eq!(config.service.pod, "pod-b");
     }
 
     #[test]
     fn preserves_the_local_pod_when_the_api_reports_none() {
         let mut config = cfg("pod-a");
         apply_live_pod(&mut config, None);
-        assert_eq!(config.service.fk_pod, "pod-a");
+        assert_eq!(config.service.pod, "pod-a");
     }
 
     #[test]
@@ -1186,20 +1186,20 @@ mod apply_live_pod_tests {
         // would then reject the config on the next push.
         let mut config = cfg("pod-a");
         apply_live_pod(&mut config, Some("   "));
-        assert_eq!(config.service.fk_pod, "pod-a");
+        assert_eq!(config.service.pod, "pod-a");
     }
 
     #[test]
     fn fills_in_an_empty_local_pod() {
         let mut config = cfg("");
         apply_live_pod(&mut config, Some("pod-b"));
-        assert_eq!(config.service.fk_pod, "pod-b");
+        assert_eq!(config.service.pod, "pod-b");
     }
 
     #[test]
     fn is_a_no_op_when_the_pods_already_agree() {
         let mut config = cfg("pod-b");
         apply_live_pod(&mut config, Some("pod-b"));
-        assert_eq!(config.service.fk_pod, "pod-b");
+        assert_eq!(config.service.pod, "pod-b");
     }
 }

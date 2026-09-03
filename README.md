@@ -137,7 +137,7 @@ These flags work on every command:
 
 ### `partiri secrets <subcommand>`
 
-Workspace-scoped credentials for private repositories and container registries. The UUID returned on creation is what you pass to `partiri service token --secret <UUID>` (or set as `fk_service_secret` in `.partiri.jsonc`) to grant a service access to a private source.
+Workspace-scoped credentials for private repositories and container registries. The UUID returned on creation is what you pass to `partiri service token --secret <UUID>` (or set as `service_secret` in `.partiri.jsonc`) to grant a service access to a private source.
 
 | Subcommand                             | Description                                                              |
 |----------------------------------------|--------------------------------------------------------------------------|
@@ -399,8 +399,8 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
   // Assigned by Partiri after running 'partiri service create'. Leave null until then.
   "id": null,
 
-  "fk_workspace": "<uuid>",
-  "fk_project": "<uuid>",
+  "workspace": "<uuid>",
+  "project": "<uuid>",
 
   "service": {
     "name": "my-service",
@@ -422,15 +422,15 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
     // "registry_url": "ghcr.io/owner/image:tag",  // full image reference; API splits host, repo, tag
 
     // Authentication token for private repos/registries — set via 'partiri service token'
-    // "fk_service_secret": "<uuid>",
+    // "service_secret": "<uuid>",
 
     "build_command": "npm run build",
     // "build_path": "dist",
     // "pre_deploy_command": "npm run migrate",
     "run_command": "npm start",
 
-    "fk_region": "<region-uuid>",
-    "fk_pod": "<pod-uuid>",
+    "region": "<region-uuid>",
+    "pod": "<pod-uuid>",
 
     "health_check_path": "/health",
 
@@ -462,8 +462,8 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | Field                             | Required  | Description                                                                 |
 |------------------------------------|-----------|-----------------------------------------------------------------------------|
 | `id`                               | Auto      | Service UUID. Set by `service create`; leave `null` initially.              |
-| `fk_workspace`                     | Yes       | UUID of the target workspace.                                               |
-| `fk_project`                       | Yes       | UUID of the target project. Must belong to `fk_workspace`.                  |
+| `workspace`                     | Yes       | UUID of the target workspace.                                               |
+| `project`                       | Yes       | UUID of the target project. Must belong to `workspace`.                  |
 | `service.name`                     | Yes       | Service name (≤16 chars), unique within the project.                        |
 | `service.deploy_type`              | Yes       | `webservice`, `static`, `private-service`, `worker`, or `cronjob`. Managed databases are not services — see `partiri db`. |
 | `service.runtime`                  | Yes       | `node`, `deno`, `rust`, `python`, `go`, `ruby`, `elixir`, `php`, `jvm`, `dotnet`, `cpp`, `static`, or `registry`. |
@@ -471,13 +471,13 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | `service.repository_url`           | *Either*  | Git repository URL. Mutually exclusive with `registry_url`.                 |
 | `service.repository_branch`        | Cond.     | Branch to deploy. Required when `repository_url` is set.                    |
 | `service.registry_url`             | *Either*  | Full container image reference (e.g. `ghcr.io/owner/image:tag`). The API splits host, repository, and tag server-side. Mutually exclusive with `repository_url`; not supported for `static`. |
-| `service.fk_service_secret`        | Cond.     | Secret UUID for private repo/registry access. Set via `partiri service token`. |
+| `service.service_secret`        | Cond.     | Secret UUID for private repo/registry access. Set via `partiri service token`. |
 | `service.build_command`            | Cond.     | Build command. Required for repository sources on non-static runtimes.      |
 | `service.build_path`               | No        | Build output directory (e.g. `dist`).                                       |
 | `service.pre_deploy_command`       | No        | Command run before each deploy (e.g. DB migrations).                        |
 | `service.run_command`              | Cond.     | Start command. Required for `webservice`, `private-service`, and source-built `worker`. A `cronjob` needs this or `registry_url` — it is the command each run executes. |
-| `service.fk_region`                | Yes       | Region UUID. List via `partiri regions list --workspace <UUID>`.            |
-| `service.fk_pod`                   | Yes       | Compute pod UUID (CPU/RAM tier). List via `partiri pods list --workspace <UUID>`. |
+| `service.region`                | Yes       | Region UUID. List via `partiri regions list --workspace <UUID>`.            |
+| `service.pod`                   | Yes       | Compute pod UUID (CPU/RAM tier). List via `partiri pods list --workspace <UUID>`. |
 | `service.health_check_path`        | No        | Health-check path or absolute URL. `null` disables the check. Not used by `worker` or `cronjob`, neither of which takes inbound traffic. |
 | `service.scheduler`                | Cond.     | 5-field cron expression, e.g. `0 3 * * *`. **The discriminator for batch workloads**: present → recurring CronJob, absent → one-shot Job. Only valid on `deploy_type: "cronjob"`; the API ignores it elsewhere. Runs must be at least 5 minutes apart. |
 | `service.cronjob_active_deadline_seconds` | Cond. | **Required for `cronjob`**, 1–3600. Hard kill-timeout for a single run. Runs are billed per minute of actual duration, and this is what the per-run balance pre-authorization is sized against. |

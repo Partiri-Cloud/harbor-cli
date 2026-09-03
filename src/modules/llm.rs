@@ -210,13 +210,13 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // "repository_url": null,
     // "repository_branch": null,
     // For private images, set fk_service_secret to a registry-secret UUID:
-    // "fk_service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
+    // "service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
     } else {
         r#"    "repository_url": "https://github.com/your-org/your-repo.git",
     "repository_branch": "main",
     // "registry_url": null,
     // For private repos, set fk_service_secret to a repository-secret UUID:
-    // "fk_service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
+    // "service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
     };
 
     // Only a cronjob reads these; on any other deploy type the API ignores
@@ -251,8 +251,8 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
         r#"{{
   // The service ID is assigned by 'partiri service create'; leave null until then.
   "id": null,
-  "fk_workspace": "<workspace UUID — run 'partiri -j llm context' to discover>",
-  "fk_project":   "<project UUID — same source>",
+  "workspace": "<workspace UUID — run 'partiri -j llm context' to discover>",
+  "project":   "<project UUID — same source>",
 
   "service": {{
     "name": "my-service",                  // ≤16 chars
@@ -267,8 +267,8 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // "pre_deploy_command": "",
 {run_line}
 
-    "fk_region": "<region UUID>",
-    "fk_pod":    "<pod UUID>",
+    "region": "<region UUID>",
+    "pod":    "<pod UUID>",
 {cronjob_block}
     // "health_check_path": "/health",
     "maintenance_mode": false,
@@ -974,9 +974,9 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
                     services_per_project.push(json!({
                         "id": s.id,
                         "name": s.name,
-                        "fk_project": p.id,
-                        "fk_region": s.primary_region(),
-                        "fk_pod": s.fk_pod,
+                        "project": p.id,
+                        "region": s.primary_region(),
+                        "pod": s.fk_pod,
                         "deploy_type": s.deploy_type,
                         "runtime": s.runtime,
                         "db_type": s.db_type,
@@ -1103,10 +1103,10 @@ pub fn run_next() -> Result<()> {
 }
 
 fn deduce_state(cfg: &PartiriConfig) -> (String, String, String) {
-    if cfg.fk_workspace.is_empty()
-        || cfg.fk_project.is_empty()
-        || cfg.service.fk_region.is_empty()
-        || cfg.service.fk_pod.is_empty()
+    if cfg.workspace.is_empty()
+        || cfg.project.is_empty()
+        || cfg.service.region.is_empty()
+        || cfg.service.pod.is_empty()
     {
         return (
             "needs_uuids".into(),
@@ -1200,7 +1200,7 @@ mod tests {
         let mut actual: Vec<&str> = props.keys().map(|s| s.as_str()).collect();
         actual.sort_unstable();
 
-        let mut expected = vec!["id", "fk_workspace", "fk_project", "service"];
+        let mut expected = vec!["id", "workspace", "project", "service"];
         expected.sort_unstable();
 
         assert_eq!(
@@ -1231,13 +1231,13 @@ mod tests {
             "repository_url",
             "repository_branch",
             "registry_url",
-            "fk_service_secret",
+            "service_secret",
             "build_path",
             "build_command",
             "pre_deploy_command",
             "run_command",
-            "fk_region",
-            "fk_pod",
+            "region",
+            "pod",
             "scheduler",
             "cronjob_time_zone",
             "cronjob_active_deadline_seconds",

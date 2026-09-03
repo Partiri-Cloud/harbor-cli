@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The `fk_`-prefixed fields in `.partiri.jsonc` are renamed to what they actually
+  hold. `fk_workspace` → `workspace`, `fk_project` → `project`,
+  `service.fk_region` → `service.region`, `service.fk_pod` → `service.pod`, and
+  `service.fk_service_secret` → `service.service_secret`.
+
+  The prefix was the API's own foreign-key column naming leaking into a file
+  people write by hand; it described how the platform stores the value, not what
+  the user is choosing. The API still receives the column names — only the
+  manifest changed.
+
+  Old manifests keep working. Both spellings are accepted on read, the editor
+  raises no warning for the old ones, and the file is rewritten with the new
+  names on the next `service pull` or any other command that saves it.
+
+  `partiri validate` reports these checks under the new names too, so the
+  `remote.fk_workspace` row is now `remote.workspace`.
+
 ### Removed
 
 - `deploy_tag` is no longer part of `.partiri.jsonc`. It was never a setting: the

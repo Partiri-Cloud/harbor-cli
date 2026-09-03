@@ -22,14 +22,14 @@ pub struct TokenArgs {
 /// registry-or-repository secrets and prompts for a choice.
 pub fn run(client: &ApiClient, mut config: PartiriConfig, args: TokenArgs) -> Result<()> {
     if let Some(secret_id) = args.secret {
-        config.service.fk_service_secret = Some(secret_id.clone());
+        config.service.service_secret = Some(secret_id.clone());
         config.save()?;
         print_success(&format!("Token {} linked.", secret_id));
         print_info("Run 'partiri service push' to apply the change to Partiri.");
         return Ok(());
     }
     if args.clear {
-        config.service.fk_service_secret = None;
+        config.service.service_secret = None;
         config.save()?;
         print_success("Authentication token cleared.");
         print_info("Run 'partiri service push' to apply the change to Partiri.");
@@ -62,7 +62,7 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig, args: TokenArgs) -> Re
     };
 
     // Show the currently linked token if any
-    if let Some(id) = &config.service.fk_service_secret {
+    if let Some(id) = &config.service.service_secret {
         print_info(&format!("Current token: {}", id));
     } else {
         print_info("No authentication token is currently linked.");
@@ -70,15 +70,15 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig, args: TokenArgs) -> Re
 
     // Fetch secrets scoped to the service's workspace
     let secrets = if has_registry {
-        client.list_registry_secrets(&config.fk_workspace)?
+        client.list_registry_secrets(&config.workspace)?
     } else {
-        client.list_repository_secrets(&config.fk_workspace)?
+        client.list_repository_secrets(&config.workspace)?
     };
 
     if secrets.is_empty() {
         print_warning(&format!(
             "No {} secrets found in workspace {}.",
-            source_kind, config.fk_workspace
+            source_kind, config.workspace
         ));
         println!(
             "  Create one with 'partiri secrets create-{}' first.",
@@ -97,7 +97,7 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig, args: TokenArgs) -> Re
 
     if choice == labels[0] {
         // User chose to clear the token
-        config.service.fk_service_secret = None;
+        config.service.service_secret = None;
         config.save()?;
         print_success("Authentication token cleared.");
     } else {
@@ -107,7 +107,7 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig, args: TokenArgs) -> Re
             .ok_or("Selected token not found in list")?;
         // idx 0 is "none", so secret index is idx - 1
         let secret_id = secrets[idx - 1].id.clone();
-        config.service.fk_service_secret = Some(secret_id.clone());
+        config.service.service_secret = Some(secret_id.clone());
         config.save()?;
         print_success(&format!("Token {} linked.", secret_id));
     }

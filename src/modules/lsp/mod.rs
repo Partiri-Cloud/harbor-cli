@@ -352,8 +352,8 @@ impl Server {
             PendingAction::Pull {
                 service_id: id,
                 path: path.clone(),
-                fk_workspace: config.fk_workspace,
-                fk_project: config.fk_project,
+                fk_workspace: config.workspace,
+                fk_project: config.project,
             },
         );
         self.send_confirm_request(

@@ -14,11 +14,11 @@ use crate::output::{ctx, print_success_with};
 /// `partiri storage create`), so folding the declared `disk` block into this
 /// figure would bill for storage that does not exist yet.
 fn estimate_monthly_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f64> {
-    let pricing = client.get_pricing(&config.service.fk_region).ok()?;
+    let pricing = client.get_pricing(&config.service.region).ok()?;
     let pod_price = pricing
         .pods
         .iter()
-        .find(|p| p.fk_pod == config.service.fk_pod)
+        .find(|p| p.fk_pod == config.service.pod)
         .map(|p| p.price)
         .unwrap_or(0.0);
     Some(pod_price)
@@ -39,11 +39,11 @@ fn estimate_max_run_cost(client: &ApiClient, config: &PartiriConfig) -> Option<f
     }
     let minutes = f64::from(deadline.div_ceil(60));
 
-    let pricing = client.get_pricing(&svc.fk_region).ok()?;
+    let pricing = client.get_pricing(&svc.region).ok()?;
     let per_minute = pricing
         .pods
         .iter()
-        .find(|p| p.fk_pod == svc.fk_pod)
+        .find(|p| p.fk_pod == svc.pod)
         .map(|p| p.per_minute)?;
     Some(minutes * per_minute)
 }
@@ -88,8 +88,7 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig) -> Result<()> {
         return Err(Box::new(err.enriched()));
     }
 
-    let service =
-        client.create_service(&config.service, &config.fk_project, &config.fk_workspace)?;
+    let service = client.create_service(&config.service, &config.project, &config.workspace)?;
 
     // Persist the assigned ID
     config.id = Some(service.id.clone());

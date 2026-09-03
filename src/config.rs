@@ -224,9 +224,11 @@ pub struct PartiriConfig {
     /// Service ID assigned by Partiri after `partiri service create`. Null until then.
     pub id: Option<String>,
     /// UUID of the workspace this service belongs to.
-    pub fk_workspace: String,
-    /// UUID of the project this service belongs to. Must belong to `fk_workspace`.
-    pub fk_project: String,
+    #[serde(alias = "fk_workspace")]
+    pub workspace: String,
+    /// UUID of the project this service belongs to. Must belong to `workspace`.
+    #[serde(alias = "fk_project")]
+    pub project: String,
     /// The user-editable service definition.
     pub service: ServiceConfig,
 }
@@ -259,8 +261,17 @@ pub struct ServiceConfig {
     pub registry_url: Option<String>,
 
     /// Secret ID for authenticated repository / registry access. Set via `partiri service token`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fk_service_secret: Option<String>,
+    ///
+    /// Serialized as `fk_service_secret`: the API writes the service body straight
+    /// to its own columns, so the wire name stays the column name even though the
+    /// manifest dropped the prefix. Same for `region` and `pod` below.
+    #[serde(
+        rename(serialize = "fk_service_secret"),
+        alias = "fk_service_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(rename = "service_secret")]
+    pub service_secret: Option<String>,
 
     /// Output directory produced by `build_command` (e.g. `dist`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,10 +290,13 @@ pub struct ServiceConfig {
     pub run_command: Option<String>,
 
     /// Region UUID the service is deployed to.
-    pub fk_region: String,
+    #[serde(rename(serialize = "fk_region"), alias = "fk_region")]
+    #[schemars(rename = "region")]
+    pub region: String,
     /// Compute pod UUID — determines the CPU/RAM tier.
-    pub fk_pod: String,
-    // pub fk_disk_pod: String,
+    #[serde(rename(serialize = "fk_pod"), alias = "fk_pod")]
+    #[schemars(rename = "pod")]
+    pub pod: String,
 
     // ── Batch workloads (deploy_type "cronjob") ──────────────────────────
     // `scheduler` is the discriminator: set it and the service renders as a
@@ -514,14 +528,14 @@ impl PartiriConfig {
             )
         };
 
-        let secret_line = match &svc.fk_service_secret {
+        let secret_line = match &svc.service_secret {
             Some(id) => format!(
                 r#"    // Authentication token for private repository / registry access.
-    "fk_service_secret": {},"#,
+    "service_secret": {},"#,
                 json_str(id)
             ),
             None => r#"    // Authentication token for private repository / registry access.
-    // "fk_service_secret": "uuid", // run 'partiri service token' to configure"#
+    // "service_secret": "uuid",     // run 'partiri service token' to configure"#
                 .to_string(),
         };
 
@@ -654,10 +668,10 @@ impl PartiriConfig {
   "id": {},
 
   // The workspace this service belongs to (selected during init).
-  "fk_workspace": {},
+  "workspace": {},
 
   // The project this service belongs to (selected during init).
-  "fk_project": {},
+  "project": {},
 
   "service": {{
     // Display name for your service on Partiri Cloud.
@@ -690,10 +704,10 @@ impl PartiriConfig {
     "run_command": {},
 
     // Region where the service will be deployed.
-    "fk_region": {},
+    "region": {},
 
     // Compute pod — determines CPU and RAM allocated to the service.
-    "fk_pod": {},
+    "pod": {},
 {}
 
 {}
@@ -711,8 +725,8 @@ impl PartiriConfig {
 }}
 "#,
             json_opt_str(&self.id),
-            json_str(&self.fk_workspace),
-            json_str(&self.fk_project),
+            json_str(&self.workspace),
+            json_str(&self.project),
             json_str(&svc.name),
             json_str(&svc.deploy_type),
             json_str(&svc.runtime),
@@ -723,8 +737,8 @@ impl PartiriConfig {
             build_path,
             pre_deploy,
             json_opt_str(&svc.run_command),
-            json_str(&svc.fk_region),
-            json_str(&svc.fk_pod),
+            json_str(&svc.region),
+            json_str(&svc.pod),
             cronjob_section,
             health_section,
             disk_section,
@@ -801,9 +815,9 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
         !svc.root_path.is_empty(),
         "root_path is required",
     );
-    check("fk_region", !svc.fk_region.is_empty(), "Region is required");
-    check("fk_pod", !svc.fk_pod.is_empty(), "Compute pod is required");
-    // check("fk_disk_pod", !svc.fk_disk_pod.is_empty(), "Disk pod is required");
+    check("region", !svc.region.is_empty(), "Region is required");
+    check("pod", !svc.pod.is_empty(), "Compute pod is required");
+    // check("disk_pod", !svc.disk_pod.is_empty(), "Disk pod is required");
 
     // Source: must have repository OR registry, not both, not neither
     let has_repo = svc
@@ -946,8 +960,8 @@ mod tests {
     fn valid_webservice() -> PartiriConfig {
         PartiriConfig {
             id: None,
-            fk_workspace: "ws-uuid".to_string(),
-            fk_project: "proj-uuid".to_string(),
+            workspace: "ws-uuid".to_string(),
+            project: "proj-uuid".to_string(),
             service: ServiceConfig {
                 name: "my-service".to_string(),
                 deploy_type: "webservice".to_string(),
@@ -956,13 +970,13 @@ mod tests {
                 repository_url: Some("https://github.com/org/repo".to_string()),
                 repository_branch: Some("main".to_string()),
                 registry_url: None,
-                fk_service_secret: None,
+                service_secret: None,
                 build_path: None,
                 build_command: Some("npm run build".to_string()),
                 pre_deploy_command: None,
                 run_command: Some("npm start".to_string()),
-                fk_region: "region-uuid".to_string(),
-                fk_pod: "pod-uuid".to_string(),
+                region: "region-uuid".to_string(),
+                pod: "pod-uuid".to_string(),
                 health_check_path: None,
                 disk: None,
                 maintenance_mode: false,
@@ -1036,19 +1050,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_fk_region_fails() {
+    fn empty_region_fails() {
         let mut c = valid_webservice();
-        c.service.fk_region = "".to_string();
+        c.service.region = "".to_string();
         let r = validate_config(&c);
-        assert!(!r.iter().find(|r| r.field == "fk_region").unwrap().ok);
+        assert!(!r.iter().find(|r| r.field == "region").unwrap().ok);
     }
 
     #[test]
-    fn empty_fk_pod_fails() {
+    fn empty_pod_fails() {
         let mut c = valid_webservice();
-        c.service.fk_pod = "".to_string();
+        c.service.pod = "".to_string();
         let r = validate_config(&c);
-        assert!(!r.iter().find(|r| r.field == "fk_pod").unwrap().ok);
+        assert!(!r.iter().find(|r| r.field == "pod").unwrap().ok);
     }
 
     #[test]
@@ -1410,12 +1424,12 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         let loaded: PartiriConfig = json5::from_str(&json).unwrap();
         assert_eq!(config.id, loaded.id);
-        assert_eq!(config.fk_workspace, loaded.fk_workspace);
+        assert_eq!(config.workspace, loaded.workspace);
         assert_eq!(config.service.name, loaded.service.name);
         assert_eq!(config.service.deploy_type, loaded.service.deploy_type);
         assert_eq!(config.service.runtime, loaded.service.runtime);
-        assert_eq!(config.service.fk_region, loaded.service.fk_region);
-        assert_eq!(config.service.fk_pod, loaded.service.fk_pod);
+        assert_eq!(config.service.region, loaded.service.region);
+        assert_eq!(config.service.pod, loaded.service.pod);
         assert_eq!(config.service.repository_url, loaded.service.repository_url);
     }
 
@@ -1474,8 +1488,8 @@ mod tests {
     fn loading_jsonc_with_env_field_does_not_error() {
         let raw = r#"{
             "id": null,
-            "fk_workspace": "ws",
-            "fk_project": "p",
+            "workspace": "ws",
+            "project": "p",
             "service": {
                 "name": "x",
                 "deploy_type": "webservice",
@@ -1485,8 +1499,8 @@ mod tests {
                 "repository_branch": "main",
                 "build_command": "npm run build",
                 "run_command": "npm start",
-                "fk_region": "r",
-                "fk_pod": "p",
+                "region": "r",
+                "pod": "p",
                 "maintenance_mode": false,
                 "active": true,
                 "env": [{"key": "OLD", "value": "value"}]
@@ -1507,6 +1521,46 @@ mod tests {
         assert!(!json.contains("fk_service_secret"));
     }
 
+    /// The manifest dropped the `fk_` prefix but the API still writes the
+    /// service body straight to its own columns, so the wire names must not
+    /// move with it. If this breaks, every `service create` / `push` 400s.
+    #[test]
+    fn service_body_still_serializes_the_fk_column_names() {
+        let mut config = valid_webservice();
+        config.service.service_secret = Some("secret-uuid".to_string());
+        let json = serde_json::to_string(&config.service).unwrap();
+
+        for wire in ["\"fk_region\":", "\"fk_pod\":", "\"fk_service_secret\":"] {
+            assert!(json.contains(wire), "missing {wire} in {json}");
+        }
+        for local in ["\"region\":", "\"pod\":", "\"service_secret\":"] {
+            assert!(!json.contains(local), "leaked {local} into {json}");
+        }
+    }
+
+    /// A manifest written before the rename must still load, mapping the old
+    /// keys onto the new fields.
+    #[test]
+    fn legacy_fk_keys_still_deserialize() {
+        let json = r#"{"id": null, "fk_workspace": "ws", "fk_project": "proj",
+            "service": {"name": "s", "deploy_type": "webservice", "runtime": "node",
+                "root_path": ".", "repository_url": "https://github.com/x/y",
+                "fk_region": "r", "fk_pod": "p", "fk_service_secret": "sec",
+                "maintenance_mode": false, "active": true}}"#;
+        let config: PartiriConfig = json5::from_str(json).unwrap();
+        assert_eq!(config.workspace, "ws");
+        assert_eq!(config.project, "proj");
+        assert_eq!(config.service.region, "r");
+        assert_eq!(config.service.pod, "p");
+        assert_eq!(config.service.service_secret.as_deref(), Some("sec"));
+
+        // …and is rewritten with the current spelling on the next save.
+        let jsonc = config.to_jsonc_string().unwrap();
+        assert!(jsonc.contains("\"workspace\":"));
+        assert!(jsonc.contains("\"region\":"));
+        assert!(!jsonc.contains("fk_"));
+    }
+
     #[test]
     fn to_jsonc_string_roundtrip() {
         let config = valid_webservice();
@@ -1514,7 +1568,7 @@ mod tests {
         let loaded: PartiriConfig = json5::from_str(&jsonc).unwrap();
         assert_eq!(config.service.name, loaded.service.name);
         assert_eq!(config.service.deploy_type, loaded.service.deploy_type);
-        assert_eq!(config.service.fk_region, loaded.service.fk_region);
+        assert_eq!(config.service.region, loaded.service.region);
         assert_eq!(config.service.repository_url, loaded.service.repository_url);
     }
 
@@ -1616,10 +1670,10 @@ mod tests {
         // `deploy_tag` used to be cached at the top level of .partiri.jsonc. It is now
         // read from the API on demand, so manifests written by older CLIs still carry
         // the key. They must keep parsing, and the key must disappear on the next write.
-        let json = r#"{"id": null, "deploy_tag": "86362", "fk_workspace": "ws", "fk_project": "proj",
+        let json = r#"{"id": null, "deploy_tag": "86362", "workspace": "ws", "project": "proj",
             "service": {"name": "s", "deploy_type": "webservice", "runtime": "node",
                 "root_path": ".", "repository_url": "https://github.com/x/y",
-                "fk_region": "r", "fk_pod": "p", "maintenance_mode": false, "active": true}}"#;
+                "region": "r", "pod": "p", "maintenance_mode": false, "active": true}}"#;
         let config: PartiriConfig = json5::from_str(json).unwrap();
         assert_eq!(config.service.name, "s");
 
@@ -1781,8 +1835,8 @@ mod tests {
         let loaded = PartiriConfig::load_from(&nested_path).unwrap();
 
         assert_eq!(loaded.service.name, config.service.name);
-        assert_eq!(loaded.fk_workspace, config.fk_workspace);
-        assert_eq!(loaded.service.fk_region, config.service.fk_region);
+        assert_eq!(loaded.workspace, config.workspace);
+        assert_eq!(loaded.service.region, config.service.region);
     }
 
     #[test]

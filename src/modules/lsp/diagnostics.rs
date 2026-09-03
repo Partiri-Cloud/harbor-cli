@@ -27,10 +27,10 @@ fn field_paths(field: &str) -> &'static [&'static [&'static str]] {
         "deploy_type" => &[&["service", "deploy_type"]],
         "runtime" => &[&["service", "runtime"]],
         "root_path" => &[&["service", "root_path"]],
-        "fk_region" | "remote.fk_region" => &[&["service", "fk_region"]],
-        "fk_pod" | "remote.fk_pod" => &[&["service", "fk_pod"]],
-        "remote.fk_workspace" | "remote.balance" => &[&["fk_workspace"]],
-        "remote.fk_project" => &[&["fk_project"]],
+        "region" | "remote.region" => &[&["service", "region"]],
+        "pod" | "remote.pod" => &[&["service", "pod"]],
+        "remote.workspace" | "remote.balance" => &[&["workspace"]],
+        "remote.project" => &[&["project"]],
         "source" => &[&["service", "repository_url"], &["service", "registry_url"]],
         "deploy_type/static" | "remote.registry_url" => &[&["service", "registry_url"]],
         "remote.repository_url" => &[&["service", "repository_url"]],
@@ -171,15 +171,22 @@ pub(crate) fn local_diagnostics(text: &str, schema: &SchemaIndex) -> Vec<Diagnos
     out
 }
 
-/// Keys that used to be part of the schema and are now dropped on the next write.
+/// Keys that used to be part of the schema and are rewritten on the next save.
 ///
-/// Manifests written by older CLIs still carry them. They parse fine (the config
-/// structs do not deny unknown fields) and disappear the next time the file is
-/// saved, so flagging them would report a stale line as a user error. Stay quiet.
+/// Manifests written by older CLIs still carry them. They load fine — dropped
+/// keys are ignored, and renamed ones are still accepted through their serde
+/// aliases — and the file is rewritten with the current spelling the next time
+/// it is saved. Flagging them would report a working config as a user error.
 fn is_retired_key(path: &[&str], key: &str) -> bool {
-    // `deploy_tag` was a local cache of a server-assigned value; `logs` and
-    // `metrics` now read it from the API on demand.
-    path.is_empty() && key == "deploy_tag"
+    match path {
+        // `deploy_tag` was a local cache of a server-assigned value; `logs` and
+        // `metrics` now read it from the API on demand.
+        // The `fk_` prefix was the API's own column naming leaking into the
+        // manifest; the fields are now named for what they hold.
+        [] => matches!(key, "deploy_tag" | "fk_workspace" | "fk_project"),
+        ["service"] => matches!(key, "fk_region" | "fk_pod" | "fk_service_secret"),
+        _ => false,
+    }
 }
 
 /// Map remote-validation rows (from
@@ -219,8 +226,8 @@ mod tests {
   // comment
   "id": null,
   "deploy_tag": null,
-  "fk_workspace": "ws-1",
-  "fk_project": "proj-1",
+  "workspace": "ws-1",
+  "project": "proj-1",
   "service": {
     "name": "my-service",
     "deploy_type": "webservice",
@@ -230,8 +237,8 @@ mod tests {
     "repository_branch": "main",
     "build_command": "npm run build",
     "run_command": "npm start",
-    "fk_region": "region-1",
-    "fk_pod": "pod-1",
+    "region": "region-1",
+    "pod": "pod-1",
     "maintenance_mode": false,
     "active": true,
   },
@@ -302,6 +309,22 @@ mod tests {
         }
     }
 
+    /// A manifest still using the pre-rename `fk_` keys loads through the serde
+    /// aliases, so it must not light up the editor either.
+    #[test]
+    fn retired_fk_keys_are_not_flagged() {
+        let text = VALID
+            .replace("\"workspace\":", "\"fk_workspace\":")
+            .replace("\"project\":", "\"fk_project\":")
+            .replace("\"region\":", "\"fk_region\":")
+            .replace("\"pod\":", "\"fk_pod\":");
+        let diags = local_diagnostics(&text, &schema());
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Unknown field")),
+            "legacy fk_ keys must produce no unknown-field diagnostic, got: {diags:?}"
+        );
+    }
+
     /// The skip is scoped to the root — a `deploy_tag` nested under `service` is
     /// still a genuine unknown field.
     #[test]
@@ -347,8 +370,8 @@ mod tests {
     fn field_path_table_is_total_over_validate_config() {
         let broken = r#"{
   "id": null,
-  "fk_workspace": "",
-  "fk_project": "",
+  "workspace": "",
+  "project": "",
   "service": {
     "name": "",
     "deploy_type": "bad",
@@ -356,8 +379,8 @@ mod tests {
     "root_path": "",
     "repository_url": "x",
     "registry_url": "y",
-    "fk_region": "",
-    "fk_pod": "",
+    "region": "",
+    "pod": "",
     "maintenance_mode": false,
     "active": true
   }
