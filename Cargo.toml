@@ -1,6 +1,6 @@
 [package]
 name = "partiri-cli"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Partiri CLI — Deploy and manage services on Partiri Cloud"
 license = "MIT"
