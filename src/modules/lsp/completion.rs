@@ -1,5 +1,5 @@
 //! Completion for `.partiri.jsonc`: property names (schema-driven), enum
-//! values, and live `fk_*` UUIDs (context-cache-driven).
+//! values, and live UUIDs for context-backed keys (context-cache-driven).
 
 use lsp_types::{CompletionItem, CompletionItemKind, Documentation, MarkupContent, MarkupKind};
 use serde_json::Value;
@@ -69,7 +69,7 @@ pub(crate) fn completions(
             };
             let doc_workspace = PartiriConfig::parse_str(text)
                 .ok()
-                .map(|c| c.fk_workspace)
+                .map(|c| c.workspace)
                 .filter(|w| !w.is_empty());
             ContextView::new(payload)
                 .entries_for(&key, doc_workspace.as_deref())
@@ -113,15 +113,15 @@ mod tests {
 
     const DOC: &str = r#"{
   "id": null,
-  "fk_workspace": "ws-1",
-  "fk_project": "proj-1",
+  "workspace": "ws-1",
+  "project": "proj-1",
   "service": {
     "name": "svc",
     "deploy_type": "webservice",
     "runtime": "node",
     "root_path": ".",
-    "fk_region": "",
-    "fk_pod": "pod-1",
+    "region": "",
+    "pod": "pod-1",
     "maintenance_mode": false,
     "active": true
   }
@@ -144,9 +144,9 @@ mod tests {
     }
 
     #[test]
-    fn fk_region_value_offers_cached_uuids() {
+    fn region_value_offers_cached_uuids() {
         let payload = fixture_payload();
-        let offset = DOC.find("\"fk_region\": \"").unwrap() + "\"fk_region\": \"".len();
+        let offset = DOC.find("\"region\": \"").unwrap() + "\"region\": \"".len();
         let items = completions(DOC, offset, &schema(), Some(&payload));
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "Amsterdam");
@@ -154,8 +154,8 @@ mod tests {
     }
 
     #[test]
-    fn fk_values_empty_without_context() {
-        let offset = DOC.find("\"fk_region\": \"").unwrap() + "\"fk_region\": \"".len();
+    fn uuid_values_empty_without_context() {
+        let offset = DOC.find("\"region\": \"").unwrap() + "\"region\": \"".len();
         let items = completions(DOC, offset, &schema(), None);
         assert!(items.is_empty());
     }

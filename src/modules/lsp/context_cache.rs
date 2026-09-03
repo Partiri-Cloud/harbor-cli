@@ -126,12 +126,14 @@ impl<'a> ContextView<'a> {
         }
     }
 
-    /// Entries for one `fk_*` key. `workspace_id` scopes project/region/pod/
-    /// secret lookups to the document's workspace when it is set and known.
+    /// Entries for one UUID-valued key. `workspace_id` scopes project/region/
+    /// pod/secret lookups to the document's workspace when it is set and known.
+    /// The retired `fk_`-prefixed spellings are accepted so completion and hover
+    /// keep working in manifests that have not been rewritten yet.
     pub(crate) fn entries_for(&self, key: &str, workspace_id: Option<&str>) -> Vec<ResourceEntry> {
         let mut out = Vec::new();
         match key {
-            "fk_workspace" => {
+            "workspace" | "fk_workspace" => {
                 for w in self.workspaces() {
                     out.push(ResourceEntry {
                         id: str_of(w, "id"),
@@ -140,7 +142,7 @@ impl<'a> ContextView<'a> {
                     });
                 }
             }
-            "fk_project" => {
+            "project" | "fk_project" => {
                 for w in self.scoped(workspace_id) {
                     for p in arr(w, "projects") {
                         out.push(ResourceEntry {
@@ -155,7 +157,7 @@ impl<'a> ContextView<'a> {
                     }
                 }
             }
-            "fk_region" => {
+            "region" | "fk_region" => {
                 for w in self.scoped(workspace_id) {
                     for r in arr(w, "regions") {
                         let country = str_of(r, "country_code");
@@ -171,7 +173,7 @@ impl<'a> ContextView<'a> {
                     }
                 }
             }
-            "fk_pod" => {
+            "pod" | "fk_pod" => {
                 for w in self.scoped(workspace_id) {
                     for p in arr(w, "pods") {
                         let price = p
@@ -191,7 +193,7 @@ impl<'a> ContextView<'a> {
                     }
                 }
             }
-            "fk_service_secret" => {
+            "service_secret" | "fk_service_secret" => {
                 for w in self.scoped(workspace_id) {
                     for (list, kind) in [
                         ("registry_secrets", "registry secret"),
@@ -215,13 +217,7 @@ impl<'a> ContextView<'a> {
 
     /// Resolve any UUID appearing anywhere in the payload to a label, for hover.
     pub(crate) fn resolve_uuid(&self, uuid: &str) -> Option<String> {
-        for key in [
-            "fk_workspace",
-            "fk_project",
-            "fk_region",
-            "fk_pod",
-            "fk_service_secret",
-        ] {
+        for key in ["workspace", "project", "region", "pod", "service_secret"] {
             if let Some(e) = self
                 .entries_for(key, None)
                 .into_iter()
@@ -296,22 +292,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entries_for_each_fk_key() {
+    fn entries_for_each_uuid_key() {
         let payload = fixture_payload();
         let view = ContextView::new(&payload);
-        assert_eq!(view.entries_for("fk_workspace", None).len(), 1);
-        assert_eq!(view.entries_for("fk_project", Some("ws-1")).len(), 1);
-        assert_eq!(view.entries_for("fk_region", Some("ws-1")).len(), 1);
-        assert_eq!(view.entries_for("fk_pod", Some("ws-1")).len(), 1);
-        assert_eq!(view.entries_for("fk_service_secret", None).len(), 2);
+        assert_eq!(view.entries_for("workspace", None).len(), 1);
+        assert_eq!(view.entries_for("project", Some("ws-1")).len(), 1);
+        assert_eq!(view.entries_for("region", Some("ws-1")).len(), 1);
+        assert_eq!(view.entries_for("pod", Some("ws-1")).len(), 1);
+        assert_eq!(view.entries_for("service_secret", None).len(), 2);
         assert!(view.entries_for("name", None).is_empty());
+    }
+
+    /// A manifest still using the old `fk_`-prefixed keys must keep getting
+    /// completion and hover until it is rewritten.
+    #[test]
+    fn entries_for_accepts_the_retired_fk_spellings() {
+        let payload = fixture_payload();
+        let view = ContextView::new(&payload);
+        for (old, new) in [
+            ("fk_workspace", "workspace"),
+            ("fk_project", "project"),
+            ("fk_region", "region"),
+            ("fk_pod", "pod"),
+            ("fk_service_secret", "service_secret"),
+        ] {
+            assert_eq!(
+                view.entries_for(old, None).len(),
+                view.entries_for(new, None).len(),
+                "{old} must resolve like {new}"
+            );
+        }
     }
 
     #[test]
     fn pod_entry_carries_price() {
         let payload = fixture_payload();
         let view = ContextView::new(&payload);
-        let pods = view.entries_for("fk_pod", None);
+        let pods = view.entries_for("pod", None);
         assert!(pods[0].detail.contains("€4.50/mo"), "{}", pods[0].detail);
     }
 
@@ -319,7 +336,7 @@ mod tests {
     fn unknown_workspace_scope_falls_back_to_all() {
         let payload = fixture_payload();
         let view = ContextView::new(&payload);
-        assert_eq!(view.entries_for("fk_region", Some("ws-nope")).len(), 1);
+        assert_eq!(view.entries_for("region", Some("ws-nope")).len(), 1);
     }
 
     #[test]

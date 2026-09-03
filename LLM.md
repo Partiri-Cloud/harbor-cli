@@ -69,7 +69,7 @@ Invariants worth knowing up front:
 
 - `service.name` ≤ 16 characters.
 - `repository_url` XOR `registry_url` — exactly one.
-- Private repo/registry sources require `fk_service_secret` (see §5).
+- Private repo/registry sources require `service_secret` (see §5).
 - `disk` is optional and pins the service to a single region (see §5).
 - Env vars are never stored in this file — manage them with `partiri service env`.
 - `deploy_type: "cronjob"` requires `cronjob_active_deadline_seconds` (1–3600)
@@ -106,7 +106,7 @@ creating a service.
 ```sh
 partiri auth set-apikey --key "$KEY"
 partiri init --template                 # writes .partiri.jsonc with commented examples
-# (edit .partiri.jsonc — fill in fk_workspace / fk_project / fk_region / fk_pod and the service.* block)
+# (edit .partiri.jsonc — fill in workspace / project / region / pod and the service.* block)
 partiri -j llm context | jq '.data'     # to find UUIDs
 partiri -j validate --remote
 partiri -j -y service create
@@ -167,7 +167,7 @@ partiri -j secrets create-repository \
 # Step 2: link it to the service config
 partiri -j service token --secret <SECRET_UUID>
 
-# Step 3: push the new fk_service_secret to Partiri
+# Step 3: push the new service_secret to Partiri
 partiri -j service push
 
 # Step 4: confirm reachability
@@ -190,7 +190,7 @@ partiri -j secrets create-registry \
 # Step 2: link it to the service config
 partiri -j service token --secret <SECRET_UUID>
 
-# Step 3: push the new fk_service_secret to Partiri
+# Step 3: push the new service_secret to Partiri
 partiri -j service push
 
 # Step 4: confirm reachability
@@ -451,11 +451,11 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 
 - **Your service MUST listen on the port given by the `PORT` environment variable.** Partiri injects `PORT` at runtime. If your process binds to a hardcoded port instead, the health check will fail and the deploy will be marked unhealthy. Use `process.env.PORT`, `std::env::var("PORT")`, or the equivalent in your runtime.
 - **`service.name` must be ≤16 characters.** Validated locally; the API also rejects longer names.
-- **`fk_region` and `fk_pod` must come from the same workspace.** Cross-workspace UUIDs return 404.
+- **`region` and `pod` must come from the same workspace.** Cross-workspace UUIDs return 404.
 - **`repository_url` XOR `registry_url`.** Setting both errors out at `validate`.
-- **Private repositories and registries require `fk_service_secret`.** Without it, `validate --remote` fails on the source-reachability check. Create the secret with `partiri secrets create-repository` or `partiri secrets create-registry`, then link it with `partiri service token --secret <UUID>` and push.
+- **Private repositories and registries require `service_secret`.** Without it, `validate --remote` fails on the source-reachability check. Create the secret with `partiri secrets create-repository` or `partiri secrets create-registry`, then link it with `partiri service token --secret <UUID>` and push.
 - **`health_check_path` accepts either a path or an absolute URL.** Only absolute URLs are probed by `validate --remote`; relative paths are deferred to runtime.
-- **`deploy_tag` is set by the deploy job once it succeeds — not synchronously by `service deploy`.** The deploy is async, so the tag may still be empty right after the POST returns. `service deploy` does a best-effort refresh; if the job is still in progress, run `partiri llm next` (which inspects job status) or `partiri service pull` to refresh later. Required for `partiri service logs` and metrics.
+- **`partiri service logs` and `partiri service metrics` need a completed deploy.** Both are scoped to the deploy the platform is currently running, which the CLI reads from the API on each call. `service deploy` only enqueues a job, so right after it returns there may be nothing to read yet — check with `partiri llm next` or `partiri service jobs` before expecting output.
 - **`init --template` refuses to overwrite an existing `.partiri.jsonc`.** Delete the file manually first (or pull the existing service).
 - **The `disk` block is config only — `service create`/`service push` never touch storage.** Provision the volume with `partiri storage create` and change it with `partiri storage update`. `service push` prints a hint when the block diverges from the live volume, but applies nothing.
 - **`storage update` grows a volume but cannot shrink it.** A size increase is prorated and charged; a decrease is rejected (Kubernetes cannot shrink a PVC). To start smaller, `storage detach` + `storage delete` (destroys data), then `storage create`.
@@ -486,5 +486,5 @@ codes: `auth`, `validation`, `network`, `config`, `cancelled`,
 - **Region** — geographic location. Pods live in regions.
 - **Pod** — a sized compute slot (CPU + RAM + replicas). Pick a pod that matches your service's needs.
 - **Cronjob** — `deploy_type: "cronjob"`: a batch workload billed per run on actual duration. With `scheduler` set it is a recurring Kubernetes CronJob; without one it is a one-shot Job that runs once per deploy. Both need `cronjob_active_deadline_seconds`.
-- **deploy_tag** — the immutable tag of the most recent successful deploy. Used to fetch logs/metrics for that exact build.
-- **fk_*** — foreign-key fields in `.partiri.jsonc` pointing at other resources by UUID.
+- **deploy_tag** — a server-assigned tag identifying one deploy, used internally to scope logs and metrics to that exact build. It appears in `service logs -j` / `service metrics -j` output; you never set it and it is not part of `.partiri.jsonc`.
+- **workspace / project / region / pod / service_secret** — the UUID-valued fields in `.partiri.jsonc` that point at other resources. Fetch every candidate with `partiri -j llm context`. (Older manifests spell these `fk_workspace`, `fk_region`, … — still accepted, and rewritten on the next `service pull`.)

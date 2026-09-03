@@ -66,7 +66,7 @@ pub fn run_create(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     // Refuse when the service already owns a volume: a second volume for the
     // same service would never attach. Resizing or remounting an existing one
     // goes through `storage update` (the API's PATCH endpoint), not a recreate.
-    let existing = client.list_volumes(&config.fk_project)?;
+    let existing = client.list_volumes(&config.project)?;
     if let Some(vol) = find_service_volume(&existing, service_id) {
         let vol_id = vol.id.clone().unwrap_or_default();
         return Err(Box::new(
@@ -117,7 +117,7 @@ pub fn run_update(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let disk = disk_or_err(config)?;
     validate_disk(disk)?;
 
-    let volumes = client.list_volumes(&config.fk_project)?;
+    let volumes = client.list_volumes(&config.project)?;
     let vol = find_service_volume(&volumes, service_id).ok_or_else(|| {
         Box::new(
             CliError::new(
@@ -337,9 +337,9 @@ pub(crate) fn build_volume(config: &PartiriConfig, service_id: &str, disk: &Disk
     Volume {
         id: None,
         name: derive_volume_name(&config.service.name),
-        fk_project: config.fk_project.clone(),
-        fk_workspace: config.fk_workspace.clone(),
-        fk_region: config.service.fk_region.clone(),
+        fk_project: config.project.clone(),
+        fk_workspace: config.workspace.clone(),
+        fk_region: config.service.region.clone(),
         fk_service: Some(service_id.to_string()),
         mount_path: canonical_mount_path(&disk.mount_path).to_string(),
         size: disk.size,
@@ -540,9 +540,8 @@ mod tests {
         use crate::config::ServiceConfig;
         PartiriConfig {
             id: Some("svc-1".to_string()),
-            deploy_tag: None,
-            fk_workspace: "ws-1".to_string(),
-            fk_project: "proj-1".to_string(),
+            workspace: "ws-1".to_string(),
+            project: "proj-1".to_string(),
             service: ServiceConfig {
                 name: "My Service".to_string(),
                 deploy_type: "webservice".to_string(),
@@ -551,13 +550,13 @@ mod tests {
                 repository_url: Some("https://github.com/o/r".to_string()),
                 repository_branch: Some("main".to_string()),
                 registry_url: None,
-                fk_service_secret: None,
+                service_secret: None,
                 build_path: None,
                 build_command: Some("npm run build".to_string()),
                 pre_deploy_command: None,
                 run_command: Some("npm start".to_string()),
-                fk_region: "reg-1".to_string(),
-                fk_pod: "pod-1".to_string(),
+                region: "reg-1".to_string(),
+                pod: "pod-1".to_string(),
                 health_check_path: None,
                 disk: Some(disk("/app/data", 3)),
                 maintenance_mode: false,

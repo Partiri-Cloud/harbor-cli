@@ -227,7 +227,7 @@ mod tests {
     const DOC: &str = r#"{
   // a comment
   "id": null,
-  "fk_workspace": "ws-1",
+  "workspace": "ws-1",
   "service": {
     "name": "svc",
     "runtime": "node",

@@ -624,16 +624,16 @@ pub fn run(args: InitArgs) -> Result<()> {
     let is_registry = registry_url.is_some();
 
     // ── Workspace ──
-    let fk_workspace = prompt_for_workspace(client.as_ref())?;
+    let workspace = prompt_for_workspace(client.as_ref())?;
 
     // ── Project ──
-    let fk_project = prompt_for_project(client.as_ref(), &fk_workspace)?;
+    let project = prompt_for_project(client.as_ref(), &workspace)?;
 
     // ── Region ──
-    let fk_region = prompt_for_region(client.as_ref(), &fk_workspace)?;
+    let region = prompt_for_region(client.as_ref(), &workspace)?;
 
     // ── Pod (compute) ──
-    let fk_pod = prompt_for_pod(client.as_ref(), &fk_workspace, Some(&fk_region))?;
+    let pod = prompt_for_pod(client.as_ref(), &workspace, Some(&region))?;
 
     // ── Auth token (optional, requires API key) ──
     let source_kind = if is_registry {
@@ -641,7 +641,7 @@ pub fn run(args: InitArgs) -> Result<()> {
     } else {
         "repository"
     };
-    let fk_service_secret = prompt_for_token(client.as_ref(), &fk_workspace, source_kind);
+    let service_secret = prompt_for_token(client.as_ref(), &workspace, source_kind);
 
     // ── Runtime ──
     // For registry images the runtime is implicit — no selection needed.
@@ -760,9 +760,8 @@ pub fn run(args: InitArgs) -> Result<()> {
     // ── Assemble config ──
     let config = PartiriConfig {
         id: None,
-        deploy_tag: None,
-        fk_workspace,
-        fk_project,
+        workspace,
+        project,
         service: ServiceConfig {
             name,
             deploy_type,
@@ -771,13 +770,13 @@ pub fn run(args: InitArgs) -> Result<()> {
             repository_url,
             repository_branch,
             registry_url,
-            fk_service_secret,
+            service_secret,
             build_path,
             build_command,
             pre_deploy_command: None,
             run_command,
-            fk_region,
-            fk_pod,
+            region,
+            pod,
             scheduler,
             cronjob_active_deadline_seconds,
             health_check_path,
@@ -812,9 +811,8 @@ pub fn run(args: InitArgs) -> Result<()> {
 fn write_template() -> Result<()> {
     let config = PartiriConfig {
         id: None,
-        deploy_tag: None,
-        fk_workspace: String::new(),
-        fk_project: String::new(),
+        workspace: String::new(),
+        project: String::new(),
         service: ServiceConfig {
             name: String::new(),
             deploy_type: String::new(),
@@ -823,13 +821,13 @@ fn write_template() -> Result<()> {
             repository_url: Some(String::new()),
             repository_branch: Some(String::new()),
             registry_url: None,
-            fk_service_secret: None,
+            service_secret: None,
             build_path: None,
             build_command: None,
             pre_deploy_command: None,
             run_command: None,
-            fk_region: String::new(),
-            fk_pod: String::new(),
+            region: String::new(),
+            pod: String::new(),
             health_check_path: None,
             disk: None,
             maintenance_mode: false,
@@ -848,7 +846,7 @@ fn write_template() -> Result<()> {
                 "path": path,
                 "next_steps": [
                     "Read the file — every field is documented in inline comments.",
-                    "Fill in fk_workspace, fk_project, and the service.* block.",
+                    "Fill in workspace, project, and the service.* block.",
                     "Run 'partiri -j llm context' to fetch every workspace/project/region/pod UUID in one call.",
                     "Run 'partiri validate --remote' to check your config end-to-end.",
                     "Run 'partiri service create' once validation passes.",
@@ -878,8 +876,8 @@ fn write_template() -> Result<()> {
     println!("  then run 'partiri service create'.");
     println!();
     println!("  Fields you must populate:");
-    println!("    fk_workspace, fk_project, service.name, service.deploy_type, service.runtime,");
-    println!("    service.fk_region, service.fk_pod, and one of (repository_url+branch) or");
+    println!("    workspace, project, service.name, service.deploy_type, service.runtime,");
+    println!("    service.region, service.pod, and one of (repository_url+branch) or");
     println!("    registry_url (full image reference, e.g. ghcr.io/owner/image:tag).");
     println!();
     println!(

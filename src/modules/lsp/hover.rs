@@ -1,6 +1,6 @@
 //! Hover for `.partiri.jsonc`: schema descriptions on property names (plus
-//! enum domains and a note on `fk_*` completions), and live UUID resolution on
-//! `fk_*` / `id` string values via the cached `llm context` payload.
+//! enum domains and a note on context-backed completions), and live UUID
+//! resolution on UUID-valued keys via the cached `llm context` payload.
 
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 
@@ -9,8 +9,31 @@ use super::documents::LineIndex;
 use super::locate::{self, CursorCtx};
 use super::schema::SchemaIndex;
 
+/// Keys whose value is a UUID that completion fills from the live workspace
+/// context. The retired `fk_`-prefixed spellings are listed too, so hover still
+/// works in a manifest that has not been rewritten yet.
+const CONTEXT_KEYS: &[&str] = &[
+    "workspace",
+    "project",
+    "region",
+    "pod",
+    "service_secret",
+    "fk_workspace",
+    "fk_project",
+    "fk_region",
+    "fk_pod",
+    "fk_service_secret",
+];
+
 /// Keys whose string value is a UUID resolvable against the cached context.
+/// `id` resolves like the rest but is server-assigned, so it is not offered
+/// as a completion source.
 const UUID_KEYS: &[&str] = &[
+    "workspace",
+    "project",
+    "region",
+    "pod",
+    "service_secret",
     "fk_workspace",
     "fk_project",
     "fk_region",
@@ -85,7 +108,7 @@ fn name_hover(
         push_paragraph(&mut value, &format!("Allowed: {allowed}"));
     }
 
-    if key.starts_with("fk_") {
+    if CONTEXT_KEYS.contains(&key) {
         push_paragraph(
             &mut value,
             "Completions for this field come from the live workspace context (`partiri llm context`).",
@@ -154,15 +177,15 @@ mod tests {
 
     const DOC: &str = r#"{
   "id": null,
-  "fk_workspace": "ws-1",
-  "fk_project": "proj-1",
+  "workspace": "ws-1",
+  "project": "proj-1",
   "service": {
     "name": "svc",
     "deploy_type": "webservice",
     "runtime": "node",
     "root_path": ".",
-    "fk_region": "region-1",
-    "fk_pod": "pod-1",
+    "region": "region-1",
+    "pod": "pod-1",
     "maintenance_mode": false,
     "active": true
   }
@@ -185,11 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn fk_region_value_hover_resolves_via_context_cache() {
+    fn region_value_hover_resolves_via_context_cache() {
         let payload = fixture_payload();
         let offset = DOC.find("region-1").unwrap() + 1;
-        let result =
-            hover(DOC, offset, &schema(), Some(&payload)).expect("hover on fk_region value");
+        let result = hover(DOC, offset, &schema(), Some(&payload)).expect("hover on region value");
         let md = markdown(&result);
         assert!(md.contains("Amsterdam"), "{md}");
     }

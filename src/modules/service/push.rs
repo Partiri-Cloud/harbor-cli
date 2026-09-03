@@ -30,8 +30,8 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     // live volume and pricing for the cost delta and the divergence hint. All
     // are best-effort: a failure just drops the corresponding extra output.
     let live_service = client.read_service(id).ok();
-    let volumes = client.list_volumes(&config.fk_project).ok();
-    let pricing = client.get_pricing(&config.service.fk_region).ok();
+    let volumes = client.list_volumes(&config.project).ok();
+    let pricing = client.get_pricing(&config.service.region).ok();
 
     let current_vol = volumes
         .as_ref()
@@ -53,7 +53,7 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let desired_cost = if is_cronjob {
         None
     } else {
-        compute_pod_monthly_cost(Some(&config.service.fk_pod), pricing.as_ref())
+        compute_pod_monthly_cost(Some(&config.service.pod), pricing.as_ref())
     };
 
     // What a cronjob gets instead: the ceiling one run can reach, before and
@@ -69,7 +69,7 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
                 pricing.as_ref(),
             ),
             compute_max_run_cost(
-                Some(&config.service.fk_pod),
+                Some(&config.service.pod),
                 config.service.cronjob_active_deadline_seconds,
                 pricing.as_ref(),
             ),
@@ -270,9 +270,8 @@ mod tests {
     fn config_with_disk(pod: &str, disk: Option<DiskConfig>) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".into()),
-            deploy_tag: None,
-            fk_workspace: "ws".into(),
-            fk_project: "p".into(),
+            workspace: "ws".into(),
+            project: "p".into(),
             service: ServiceConfig {
                 name: "svc".into(),
                 deploy_type: "webservice".into(),
@@ -281,13 +280,13 @@ mod tests {
                 repository_url: Some("https://github.com/o/r".into()),
                 repository_branch: Some("main".into()),
                 registry_url: None,
-                fk_service_secret: None,
+                service_secret: None,
                 build_path: None,
                 build_command: Some("npm run build".into()),
                 pre_deploy_command: None,
                 run_command: Some("npm start".into()),
-                fk_region: "r".into(),
-                fk_pod: pod.into(),
+                region: "r".into(),
+                pod: pod.into(),
                 health_check_path: None,
                 disk,
                 maintenance_mode: false,

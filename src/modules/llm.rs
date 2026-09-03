@@ -210,13 +210,13 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // "repository_url": null,
     // "repository_branch": null,
     // For private images, set fk_service_secret to a registry-secret UUID:
-    // "fk_service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
+    // "service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
     } else {
         r#"    "repository_url": "https://github.com/your-org/your-repo.git",
     "repository_branch": "main",
     // "registry_url": null,
     // For private repos, set fk_service_secret to a repository-secret UUID:
-    // "fk_service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
+    // "service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
     };
 
     // Only a cronjob reads these; on any other deploy type the API ignores
@@ -251,9 +251,8 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
         r#"{{
   // The service ID is assigned by 'partiri service create'; leave null until then.
   "id": null,
-  "deploy_tag": null,
-  "fk_workspace": "<workspace UUID — run 'partiri -j llm context' to discover>",
-  "fk_project":   "<project UUID — same source>",
+  "workspace": "<workspace UUID — run 'partiri -j llm context' to discover>",
+  "project":   "<project UUID — same source>",
 
   "service": {{
     "name": "my-service",                  // ≤16 chars
@@ -268,8 +267,8 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // "pre_deploy_command": "",
 {run_line}
 
-    "fk_region": "<region UUID>",
-    "fk_pod":    "<pod UUID>",
+    "region": "<region UUID>",
+    "pod":    "<pod UUID>",
 {cronjob_block}
     // "health_check_path": "/health",
     "maintenance_mode": false,
@@ -674,7 +673,7 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
         ],
         "service deploy" => vec![
             "Destructive operation — pass -y to skip the confirmation in scripts.",
-            "Best-effort refresh of deploy_tag after the job is created — may still be empty if the deploy hasn't completed. Run 'partiri llm next' or 'partiri service pull' to refresh later.",
+            "The job is created asynchronously — it will not have completed when the command returns. Run 'partiri llm next' or 'partiri service jobs' to check its status.",
             "Your service MUST listen on the port given by the $PORT environment variable. Hard-coding a port causes health-check failures.",
         ],
         "service push" => vec![
@@ -975,9 +974,9 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
                     services_per_project.push(json!({
                         "id": s.id,
                         "name": s.name,
-                        "fk_project": p.id,
-                        "fk_region": s.primary_region(),
-                        "fk_pod": s.fk_pod,
+                        "project": p.id,
+                        "region": s.primary_region(),
+                        "pod": s.fk_pod,
                         "deploy_type": s.deploy_type,
                         "runtime": s.runtime,
                         "db_type": s.db_type,
@@ -1104,10 +1103,10 @@ pub fn run_next() -> Result<()> {
 }
 
 fn deduce_state(cfg: &PartiriConfig) -> (String, String, String) {
-    if cfg.fk_workspace.is_empty()
-        || cfg.fk_project.is_empty()
-        || cfg.service.fk_region.is_empty()
-        || cfg.service.fk_pod.is_empty()
+    if cfg.workspace.is_empty()
+        || cfg.project.is_empty()
+        || cfg.service.region.is_empty()
+        || cfg.service.pod.is_empty()
     {
         return (
             "needs_uuids".into(),
@@ -1125,20 +1124,8 @@ fn deduce_state(cfg: &PartiriConfig) -> (String, String, String) {
             "Config looks ready. Validate against the API, then register the service.".into(),
         );
     }
-    if cfg.deploy_tag.is_some() {
-        return (
-            "deployed".into(),
-            format!(
-                "partiri -j service jobs{}",
-                crate::config::config_flag_suffix()
-            ),
-            "Service is deployed. Inspect jobs/logs/metrics from here.".into(),
-        );
-    }
-
-    // id is set, deploy_tag is missing — check the deploy job history to disambiguate
-    // "never deployed" from "deploy in progress" / "deploy failed" / "deploy succeeded but
-    // tag not yet propagated locally".
+    // id is set — the deploy job history is the only source for what happened next,
+    // distinguishing "never deployed" from "in progress" / "failed" / "deployed".
     if let (Some(id), Ok(client)) = (cfg.id.as_deref(), ApiClient::new()) {
         if let Ok(jobs) = client.list_service_jobs(id) {
             let mut deploys: Vec<_> = jobs
@@ -1151,11 +1138,11 @@ fn deduce_state(cfg: &PartiriConfig) -> (String, String, String) {
                     "succeeded" => {
                         return (
                             "deployed".into(),
-                            format!("partiri service pull{}", crate::config::config_flag_suffix()),
                             format!(
-                                "A deploy job succeeded but deploy_tag is not yet set in {} — refresh from the API.",
-                                crate::config::config_display()
+                                "partiri -j service jobs{}",
+                                crate::config::config_flag_suffix()
                             ),
+                            "Service is deployed. Inspect jobs/logs/metrics from here.".into(),
                         );
                     }
                     "in_progress" | "open" => {
@@ -1213,7 +1200,7 @@ mod tests {
         let mut actual: Vec<&str> = props.keys().map(|s| s.as_str()).collect();
         actual.sort_unstable();
 
-        let mut expected = vec!["id", "deploy_tag", "fk_workspace", "fk_project", "service"];
+        let mut expected = vec!["id", "workspace", "project", "service"];
         expected.sort_unstable();
 
         assert_eq!(
@@ -1244,13 +1231,13 @@ mod tests {
             "repository_url",
             "repository_branch",
             "registry_url",
-            "fk_service_secret",
+            "service_secret",
             "build_path",
             "build_command",
             "pre_deploy_command",
             "run_command",
-            "fk_region",
-            "fk_pod",
+            "region",
+            "pod",
             "scheduler",
             "cronjob_time_zone",
             "cronjob_active_deadline_seconds",

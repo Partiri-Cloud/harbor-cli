@@ -65,26 +65,26 @@ fn run_with_flags(mut config: PartiriConfig, args: LinkArgs) -> Result<()> {
 
     let mut changed = false;
     if let Some(w) = args.workspace {
-        config.fk_workspace = w;
+        config.workspace = w;
         changed = true;
     }
     if let Some(p) = args.project {
-        config.fk_project = p;
+        config.project = p;
         changed = true;
     }
     if let Some(r) = args.region {
-        config.service.fk_region = r;
+        config.service.region = r;
         changed = true;
     }
     if let Some(p) = args.pod {
-        config.service.fk_pod = p;
+        config.service.pod = p;
         changed = true;
     }
     if let Some(t) = args.token {
-        config.service.fk_service_secret = Some(t);
+        config.service.service_secret = Some(t);
         changed = true;
     } else if args.clear_token {
-        config.service.fk_service_secret = None;
+        config.service.service_secret = None;
         changed = true;
     }
 
@@ -122,7 +122,7 @@ fn run_interactive(client: &ApiClient, config: &mut PartiriConfig) -> Result<()>
         .prompt()
         .map_err(|_| "Cancelled.")?;
     if update_ws {
-        config.fk_workspace = prompt_for_workspace(Some(client))?;
+        config.workspace = prompt_for_workspace(Some(client))?;
         workspace_changed = true;
         changed = true;
     }
@@ -138,7 +138,7 @@ fn run_interactive(client: &ApiClient, config: &mut PartiriConfig) -> Result<()>
             .map_err(|_| "Cancelled.")?
     };
     if update_proj {
-        config.fk_project = prompt_for_project(Some(client), &config.fk_workspace)?;
+        config.project = prompt_for_project(Some(client), &config.workspace)?;
         changed = true;
     }
 
@@ -148,7 +148,7 @@ fn run_interactive(client: &ApiClient, config: &mut PartiriConfig) -> Result<()>
         .prompt()
         .map_err(|_| "Cancelled.")?;
     if update_region {
-        config.service.fk_region = prompt_for_region(Some(client), &config.fk_workspace)?;
+        config.service.region = prompt_for_region(Some(client), &config.workspace)?;
         region_changed = true;
         changed = true;
     }
@@ -164,10 +164,10 @@ fn run_interactive(client: &ApiClient, config: &mut PartiriConfig) -> Result<()>
             .map_err(|_| "Cancelled.")?
     };
     if update_pod {
-        config.service.fk_pod = prompt_for_pod(
+        config.service.pod = prompt_for_pod(
             Some(client),
-            &config.fk_workspace,
-            Some(&config.service.fk_region),
+            &config.workspace,
+            Some(&config.service.region),
         )?;
         changed = true;
     }

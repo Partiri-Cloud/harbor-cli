@@ -201,10 +201,10 @@ pub enum ServiceCommands {
         /// New compute pod UUID. Required when --region changes.
         #[arg(long, value_name = "UUID")]
         pod: Option<String>,
-        /// Set fk_service_secret to this token UUID.
+        /// Set service_secret to this token UUID.
         #[arg(long, value_name = "UUID", conflicts_with = "clear_token")]
         token: Option<String>,
-        /// Clear fk_service_secret.
+        /// Clear service_secret.
         #[arg(long)]
         clear_token: bool,
     },
@@ -224,10 +224,10 @@ pub enum ServiceCommands {
     },
     /// Link an auth token for private repos or registries
     Token {
-        /// Set fk_service_secret to this token UUID.
+        /// Set service_secret to this token UUID.
         #[arg(long, value_name = "UUID", conflicts_with = "clear")]
         secret: Option<String>,
-        /// Clear fk_service_secret on this service.
+        /// Clear service_secret on this service.
         #[arg(long)]
         clear: bool,
     },

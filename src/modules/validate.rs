@@ -1,7 +1,7 @@
 //! `partiri validate` — check the local `.partiri.jsonc`.
 //!
 //! [`run`] runs the static field checks from [`validate_config`]; [`run_remote`]
-//! additionally hits the API to confirm the `fk_*` UUIDs exist and pair up,
+//! additionally hits the API to confirm the UUID fields exist and pair up,
 //! that the service name is unique, that the repo/registry source is reachable,
 //! and that an absolute health-check URL responds.
 
@@ -75,79 +75,79 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
     // ── UUIDs exist & belong to user ─────────────────────────────────────────
     let workspaces = client.list_workspaces();
     match &workspaces {
-        Ok(ws) if ws.iter().any(|w| w.id == config.fk_workspace) => rows.push(CheckRow::ok(
-            "remote.fk_workspace",
+        Ok(ws) if ws.iter().any(|w| w.id == config.workspace) => rows.push(CheckRow::ok(
+            "remote.workspace",
             "workspace exists for this API key",
         )),
         Ok(_) => rows.push(CheckRow::fail(
-            "remote.fk_workspace",
+            "remote.workspace",
             "workspace UUID not found for this API key. Run 'partiri workspaces list' or 'partiri llm context'.",
         )),
         Err(e) => rows.push(CheckRow::fail(
-            "remote.fk_workspace",
+            "remote.workspace",
             &format!("could not list workspaces: {}", e),
         )),
     }
 
-    if !config.fk_workspace.is_empty() {
-        match client.list_projects(&config.fk_workspace) {
+    if !config.workspace.is_empty() {
+        match client.list_projects(&config.workspace) {
             Ok(projects) => {
-                if projects.iter().any(|p| p.id == config.fk_project) {
+                if projects.iter().any(|p| p.id == config.project) {
                     rows.push(CheckRow::ok(
-                        "remote.fk_project",
+                        "remote.project",
                         "project exists in this workspace",
                     ));
                 } else {
                     rows.push(CheckRow::fail(
-                        "remote.fk_project",
+                        "remote.project",
                         "project UUID not in this workspace. Run 'partiri projects list --workspace <UUID>'.",
                     ));
                 }
             }
             Err(e) => rows.push(CheckRow::fail(
-                "remote.fk_project",
+                "remote.project",
                 &format!("could not list projects: {}", e),
             )),
         }
 
-        let regions = client.list_regions(&config.fk_workspace);
+        let regions = client.list_regions(&config.workspace);
         let region_ok = match &regions {
-            Ok(rs) => rs.iter().any(|r| r.id == config.service.fk_region),
+            Ok(rs) => rs.iter().any(|r| r.id == config.service.region),
             Err(_) => false,
         };
         if region_ok {
             rows.push(CheckRow::ok(
-                "remote.fk_region",
+                "remote.region",
                 "region available in this workspace",
             ));
         } else {
             rows.push(CheckRow::fail(
-                "remote.fk_region",
+                "remote.region",
                 "region UUID not available in this workspace. Run 'partiri regions list --workspace <UUID>'.",
             ));
         }
 
-        let pods = client.list_pods(&config.fk_workspace);
+        let pods = client.list_pods(&config.workspace);
         let pod_ok = match &pods {
-            Ok(ps) => ps.iter().any(|p| p.id == config.service.fk_pod),
+            Ok(ps) => ps.iter().any(|p| p.id == config.service.pod),
             Err(_) => false,
         };
         if pod_ok {
             rows.push(CheckRow::ok(
-                "remote.fk_pod",
+                "remote.pod",
                 "pod available in this workspace",
             ));
         } else {
             rows.push(CheckRow::fail(
-                "remote.fk_pod",
+                "remote.pod",
                 "pod UUID not available in this workspace. Run 'partiri pods list --workspace <UUID>'.",
             ));
         }
     }
 
     // ── Service-name uniqueness within project (skipped if id is set) ────────
-    if config.id.is_none() && !config.fk_project.is_empty() && !config.service.name.is_empty() {
-        match client.list_services(&config.fk_project, 50) {
+    if config.id.is_none() && !config.project.is_empty() && !config.service.name.is_empty() {
+        match client.list_services(&config.project, 50) {
             Ok(services) => {
                 if services.iter().any(|s| s.name == config.service.name) {
                     rows.push(CheckRow::fail(
@@ -175,8 +175,8 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
         .as_deref()
         .filter(|s| !s.is_empty())
     {
-        let secret_id = config.service.fk_service_secret.as_deref();
-        match client.load_repository_branches(&config.fk_workspace, repo_url, secret_id) {
+        let secret_id = config.service.service_secret.as_deref();
+        match client.load_repository_branches(&config.workspace, repo_url, secret_id) {
             Ok(branches) => {
                 rows.push(CheckRow::ok(
                     "remote.repository_url",
@@ -207,7 +207,7 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
             }
             Err(e) => {
                 let hint = if secret_id.is_none() {
-                    " — if this is a private repo, set fk_service_secret via 'partiri service token --secret <UUID>'."
+                    " — if this is a private repo, set service_secret via 'partiri service token --secret <UUID>'."
                 } else {
                     ""
                 };
@@ -226,12 +226,12 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
         .as_deref()
         .filter(|s| !s.is_empty())
     {
-        let secret_id = config.service.fk_service_secret.as_deref();
-        match client.validate_registry(&config.fk_workspace, registry_url, secret_id) {
+        let secret_id = config.service.service_secret.as_deref();
+        match client.validate_registry(&config.workspace, registry_url, secret_id) {
             Ok(_) => rows.push(CheckRow::ok("remote.registry_url", "registry reachable")),
             Err(e) => {
                 let hint = if secret_id.is_none() {
-                    " — if this image is private, set fk_service_secret via 'partiri service token --secret <UUID>'."
+                    " — if this image is private, set service_secret via 'partiri service token --secret <UUID>'."
                 } else {
                     ""
                 };
@@ -244,8 +244,8 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
     }
 
     // ── Balance preflight (warn-only — never hard-block) ─────────────────────
-    if !config.fk_workspace.is_empty() {
-        match client.get_balance(&config.fk_workspace) {
+    if !config.workspace.is_empty() {
+        match client.get_balance(&config.workspace) {
             Ok(balance) => {
                 let amount = balance.amount;
                 if amount <= 0.0 {
@@ -278,7 +278,7 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
         .filter(|s| !s.is_empty())
     {
         if path.starts_with("http://") || path.starts_with("https://") {
-            match client.probe_health_check(&config.fk_workspace, path) {
+            match client.probe_health_check(&config.workspace, path) {
                 Ok(r) if r.ok => rows.push(CheckRow::ok(
                     "remote.health_check_path",
                     &format!(
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn check_row_fail_is_fail() {
-        let row = CheckRow::fail("remote.fk_workspace", "not found");
+        let row = CheckRow::fail("remote.workspace", "not found");
         assert!(row.is_fail());
     }
 
