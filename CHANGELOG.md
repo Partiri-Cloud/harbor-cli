@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `deploy_tag` is no longer part of `.partiri.jsonc`. It was never a setting: the
+  platform assigns it on every deploy so it can tag images and scope observability,
+  and the API rejected it on writes — the manifest only cached a copy of what the
+  server had already decided. Caching it bought nothing, since `service logs` and
+  `service metrics` were each fetching the service from the API on every run
+  anyway, and it introduced a failure mode of its own: a stale or missing local
+  value made `service logs` refuse to run until you remembered to `service pull`.
+
+  Both commands now read the tag from that same API response. `service logs` on a
+  service that has never been deployed says so, instead of blaming the config file.
+
+  Existing manifests keep working — the key is ignored on read, no editor warning
+  is raised for it, and it is dropped the next time the file is written.
+
+- `service deploy` no longer writes to `.partiri.jsonc` after enqueuing the job.
+  It had been doing a best-effort refresh to pick up the new tag; there is nothing
+  left to refresh. `partiri llm next` now derives the deployed state purely from
+  deploy-job history, so it can no longer report "deployed" from a stale local value.
+
 ## [0.5.0] — 2026-09-02
 
 ### Added

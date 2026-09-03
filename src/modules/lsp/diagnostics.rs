@@ -131,7 +131,8 @@ pub(crate) fn local_diagnostics(text: &str, schema: &SchemaIndex) -> Vec<Diagnos
         ));
     }
 
-    // 4. Unknown keys per level, plus the env special case.
+    // 4. Unknown keys per level, plus the env special case and the retired
+    //    top-level keys we stay quiet about (see `is_retired_key`).
     for (path, level) in [
         (vec![], &schema.root),
         (vec!["service".to_string()], &schema.service),
@@ -142,7 +143,7 @@ pub(crate) fn local_diagnostics(text: &str, schema: &SchemaIndex) -> Vec<Diagnos
     ] {
         let path_refs: Vec<&str> = path.iter().map(String::as_str).collect();
         for key in locate::keys_at_path(&ast, &path_refs) {
-            if level.contains_key(&key) {
+            if level.contains_key(&key) || is_retired_key(&path_refs, &key) {
                 continue;
             }
             let mut full: Vec<&str> = path_refs.clone();
@@ -168,6 +169,17 @@ pub(crate) fn local_diagnostics(text: &str, schema: &SchemaIndex) -> Vec<Diagnos
     }
 
     out
+}
+
+/// Keys that used to be part of the schema and are now dropped on the next write.
+///
+/// Manifests written by older CLIs still carry them. They parse fine (the config
+/// structs do not deny unknown fields) and disappear the next time the file is
+/// saved, so flagging them would report a stale line as a user error. Stay quiet.
+fn is_retired_key(path: &[&str], key: &str) -> bool {
+    // `deploy_tag` was a local cache of a server-assigned value; `logs` and
+    // `metrics` now read it from the API on demand.
+    path.is_empty() && key == "deploy_tag"
 }
 
 /// Map remote-validation rows (from
@@ -274,6 +286,34 @@ mod tests {
             .find(|d| d.message.contains("Unknown field 'prot'"))
             .expect("unknown-key diagnostic");
         assert_eq!(d.severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    /// `deploy_tag` is retired, not unknown: manifests written by older CLIs still
+    /// carry it and must not light up the editor. VALID already contains the key.
+    #[test]
+    fn retired_deploy_tag_key_is_not_flagged() {
+        let with_value = VALID.replace("\"deploy_tag\": null,", "\"deploy_tag\": \"86362\",");
+        for text in [VALID.to_string(), with_value] {
+            let diags = local_diagnostics(&text, &schema());
+            assert!(
+                !diags.iter().any(|d| d.message.contains("deploy_tag")),
+                "deploy_tag must produce no diagnostic, got: {diags:?}"
+            );
+        }
+    }
+
+    /// The skip is scoped to the root — a `deploy_tag` nested under `service` is
+    /// still a genuine unknown field.
+    #[test]
+    fn deploy_tag_inside_service_still_warns() {
+        let text = VALID.replace(
+            "\"root_path\": \".\",",
+            "\"root_path\": \".\",\n    \"deploy_tag\": \"86362\",",
+        );
+        let diags = local_diagnostics(&text, &schema());
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("Unknown field 'deploy_tag'")));
     }
 
     #[test]

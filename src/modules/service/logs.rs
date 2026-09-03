@@ -10,15 +10,20 @@ use crate::output::{ctx, format_datetime, print_result};
 /// Maximum number of log lines shown (most recent).
 const LINES: usize = 35;
 
-/// Entry point for `partiri service logs`. Requires `deploy_tag` to be set in
-/// the config; prints the last [`LINES`] lines from the past hour.
+/// Entry point for `partiri service logs`. Reads the deploy tag from the API —
+/// it is server-assigned on each deploy — and prints the last [`LINES`] lines
+/// from the past hour.
 pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let id = config.id_or_err()?;
-    let deploy_tag = config.deploy_tag.as_deref().ok_or_else(|| {
+    let service = client.read_service(id)?;
+    let deploy_tag = service.deploy_tag.as_deref().ok_or_else(|| {
         Box::new(
-            CliError::new("missing_dependency", "No deploy_tag found in config.")
-                .with_hint("Run 'partiri service pull' to refresh it after your latest deployment.")
-                .enriched(),
+            CliError::new(
+                "missing_dependency",
+                "This service has not been deployed yet.",
+            )
+            .with_hint("Run 'partiri service deploy' first; logs are scoped to a deployment.")
+            .enriched(),
         ) as crate::error::Error
     })?;
     let resp = client.read_service_logs(id, Some(deploy_tag))?;

@@ -223,9 +223,6 @@ pub const DISK_SIZE_MAX: u32 = 10;
 pub struct PartiriConfig {
     /// Service ID assigned by Partiri after `partiri service create`. Null until then.
     pub id: Option<String>,
-    /// Deploy tag set by Partiri after each deployment. Used to scope logs and metrics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deploy_tag: Option<String>,
     /// UUID of the workspace this service belongs to.
     pub fk_workspace: String,
     /// UUID of the project this service belongs to. Must belong to `fk_workspace`.
@@ -656,10 +653,6 @@ impl PartiriConfig {
   // Leave as null until you have created the service.
   "id": {},
 
-  // Set by Partiri after each deployment. Required for 'partiri service logs' and metrics.
-  // Run 'partiri service pull' to refresh this value after a new deployment.
-  "deploy_tag": {},
-
   // The workspace this service belongs to (selected during init).
   "fk_workspace": {},
 
@@ -718,7 +711,6 @@ impl PartiriConfig {
 }}
 "#,
             json_opt_str(&self.id),
-            json_opt_str(&self.deploy_tag),
             json_str(&self.fk_workspace),
             json_str(&self.fk_project),
             json_str(&svc.name),
@@ -954,7 +946,6 @@ mod tests {
     fn valid_webservice() -> PartiriConfig {
         PartiriConfig {
             id: None,
-            deploy_tag: None,
             fk_workspace: "ws-uuid".to_string(),
             fk_project: "proj-uuid".to_string(),
             service: ServiceConfig {
@@ -1483,7 +1474,6 @@ mod tests {
     fn loading_jsonc_with_env_field_does_not_error() {
         let raw = r#"{
             "id": null,
-            "deploy_tag": null,
             "fk_workspace": "ws",
             "fk_project": "p",
             "service": {
@@ -1622,25 +1612,20 @@ mod tests {
     }
 
     #[test]
-    fn to_jsonc_string_with_deploy_tag_set_roundtrips() {
-        let mut config = valid_webservice();
-        config.deploy_tag = Some("ab12c".to_string());
-        let jsonc = config.to_jsonc_string().unwrap();
-        assert!(jsonc.contains("ab12c"));
-        assert!(jsonc.contains("deploy_tag"));
-        let loaded: PartiriConfig = json5::from_str(&jsonc).unwrap();
-        assert_eq!(loaded.deploy_tag, Some("ab12c".to_string()));
-    }
-
-    #[test]
-    fn deploy_tag_none_deserializes_from_missing_field() {
-        // Simulates an existing .partiri.jsonc without deploy_tag (backward compat)
-        let json = r#"{"id": null, "fk_workspace": "ws", "fk_project": "proj",
+    fn legacy_deploy_tag_key_is_ignored_and_dropped_on_rewrite() {
+        // `deploy_tag` used to be cached at the top level of .partiri.jsonc. It is now
+        // read from the API on demand, so manifests written by older CLIs still carry
+        // the key. They must keep parsing, and the key must disappear on the next write.
+        let json = r#"{"id": null, "deploy_tag": "86362", "fk_workspace": "ws", "fk_project": "proj",
             "service": {"name": "s", "deploy_type": "webservice", "runtime": "node",
                 "root_path": ".", "repository_url": "https://github.com/x/y",
                 "fk_region": "r", "fk_pod": "p", "maintenance_mode": false, "active": true}}"#;
         let config: PartiriConfig = json5::from_str(json).unwrap();
-        assert!(config.deploy_tag.is_none());
+        assert_eq!(config.service.name, "s");
+
+        let jsonc = config.to_jsonc_string().unwrap();
+        assert!(!jsonc.contains("deploy_tag"));
+        assert!(!jsonc.contains("86362"));
     }
 
     #[test]

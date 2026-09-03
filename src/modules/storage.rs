@@ -540,7 +540,6 @@ mod tests {
         use crate::config::ServiceConfig;
         PartiriConfig {
             id: Some("svc-1".to_string()),
-            deploy_tag: None,
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {

@@ -1,8 +1,5 @@
 //! `partiri service pull` — fetch an existing service from the API into a local
 //! `.partiri.jsonc`.
-//!
-//! Also exposes [`silent_refresh`], the no-prompt `deploy_tag`-only refresh used
-//! by read-only commands (`logs`, `metrics`) and post-deploy follow-ups.
 
 use inquire::{Confirm, Select};
 use owo_colors::OwoColorize;
@@ -13,47 +10,17 @@ use crate::error::{CliError, Result};
 use crate::modules::storage::{disk_from_volume, find_service_volume};
 use crate::output::{ctx, print_success};
 
-/// Refresh API-owned fields on the local config (`deploy_tag` only) without
-/// prompts. Used by `logs`, `metrics`, and post-deploy follow-ups.
-///
-/// We deliberately do NOT pull the entire service object back: the user may have
-/// local edits to env / build_command / source URLs / etc. that they haven't
-/// `partiri service push`ed yet, and overwriting them on a read-only command
-/// like `service logs` would silently destroy work. The user is canonical for
-/// configuration; the API is canonical for `deploy_tag` (and `id`, but that's
-/// already set on create). For a full server-side refresh, run `service pull`
-/// explicitly.
-///
-/// Returns an error when the config has no `id` or the API call fails; callers
-/// fall back to the cached config.
-pub fn silent_refresh(client: &ApiClient, existing: &PartiriConfig) -> Result<PartiriConfig> {
-    let id = existing
-        .id
-        .as_deref()
-        .ok_or("Service has no id yet; cannot refresh")?;
-    let service = client.read_service(id)?;
-
-    let mut refreshed = existing.clone();
-    let dirty = refreshed.deploy_tag != service.deploy_tag;
-    refreshed.deploy_tag = service.deploy_tag;
-    if dirty {
-        refreshed.save()?;
-    }
-    Ok(refreshed)
-}
-
 /// Refresh path for an explicit `partiri service pull` over a config that
-/// already has an `id`. Unlike [`silent_refresh`] (deploy_tag only, used by
-/// read-only commands) this is a user-initiated pull, so it folds the live
+/// already has an `id`. This is a user-initiated pull, so it folds the live
 /// volume into the `disk` block via [`apply_live_disk`]: when the service has a
 /// live volume it adopts that volume's mount path and size (warning if it
 /// replaces a diverging local edit); when there is no live volume the existing
 /// block is preserved, so a disk declared for a not-yet-run `storage create`
 /// survives a pull; and when the storage listing fails it warns and leaves the
 /// block unchanged rather than aborting the whole pull. It also adopts the live
-/// compute pod via [`apply_live_pod`]. Either way the `deploy_tag` refresh and
-/// the save still happen. Other local, possibly-unpushed service edits (env,
-/// build_command, source URLs, …) are always preserved.
+/// compute pod via [`apply_live_pod`]. Either way the save still happens. Other
+/// local, possibly-unpushed service edits (env, build_command, source URLs, …)
+/// are always preserved.
 fn refresh_existing(client: &ApiClient, existing: &PartiriConfig) -> Result<PartiriConfig> {
     let id = existing
         .id
@@ -62,7 +29,6 @@ fn refresh_existing(client: &ApiClient, existing: &PartiriConfig) -> Result<Part
     let service = client.read_service(id)?;
 
     let mut refreshed = existing.clone();
-    refreshed.deploy_tag = service.deploy_tag;
     apply_live_pod(&mut refreshed, service.fk_pod.as_deref());
     let fetched = fetch_service_disk(client, &refreshed.fk_project, id);
     apply_live_disk(&mut refreshed, fetched);
@@ -257,7 +223,7 @@ pub(crate) fn overwrite_guard(
 /// Entry point for `partiri service pull`.
 ///
 /// If a `.partiri.jsonc` with an `id` already exists, refreshes it in place via
-/// [`silent_refresh`]. Otherwise walks an interactive workspace → project →
+/// [`refresh_existing`]. Otherwise walks an interactive workspace → project →
 /// service selection and writes a fresh config. This is the one `service`
 /// subcommand that does not require an existing config file.
 pub fn run(client: &ApiClient) -> Result<()> {
@@ -443,7 +409,6 @@ pub(crate) fn map_to_config(
         .ok_or("Pulled service is missing a primary region replica")?;
     Ok(PartiriConfig {
         id: Some(id),
-        deploy_tag: svc.deploy_tag,
         fk_workspace: svc.fk_workspace.unwrap_or(fk_workspace),
         fk_project: svc.fk_project.unwrap_or(fk_project),
         service: ServiceConfig {
@@ -606,7 +571,6 @@ mod apply_live_disk_tests {
     fn cfg(disk: Option<DiskConfig>) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".to_string()),
-            deploy_tag: None,
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {
@@ -752,6 +716,7 @@ mod tests {
                 fk_region: "region-uuid".to_string(),
                 is_primary: true,
             }]),
+            deploy_tag: None,
             fk_pod: Some("pod-uuid".to_string()),
             fk_project: Some("proj-1".to_string()),
             fk_workspace: Some("ws-1".to_string()),
@@ -770,7 +735,6 @@ mod tests {
             maintenance_mode: Some(false),
             active: Some(true),
             env: None,
-            deploy_tag: None,
             created_at: None,
             updated_at: None,
         }
@@ -864,33 +828,6 @@ mod tests {
             result.is_err(),
             "Replicas without a primary should return an error"
         );
-    }
-
-    #[test]
-    fn map_to_config_deploy_tag_is_mapped() {
-        let mut svc = make_service();
-        svc.deploy_tag = Some("ab12c".to_string());
-        let config = map_to_config(
-            svc,
-            "svc-123".to_string(),
-            "ws-1".to_string(),
-            "proj-1".to_string(),
-        )
-        .unwrap();
-        assert_eq!(config.deploy_tag, Some("ab12c".to_string()));
-    }
-
-    #[test]
-    fn map_to_config_none_deploy_tag_stays_none() {
-        let svc = make_service();
-        let config = map_to_config(
-            svc,
-            "svc-123".to_string(),
-            "ws-1".to_string(),
-            "proj-1".to_string(),
-        )
-        .unwrap();
-        assert!(config.deploy_tag.is_none());
     }
 
     #[test]
@@ -1116,7 +1053,6 @@ mod overwrite_guard_tests {
     fn cfg_with_id(id: &str) -> PartiriConfig {
         PartiriConfig {
             id: Some(id.to_string()),
-            deploy_tag: None,
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {
@@ -1200,7 +1136,6 @@ mod apply_live_pod_tests {
     fn cfg(fk_pod: &str) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".to_string()),
-            deploy_tag: None,
             fk_workspace: "ws-1".to_string(),
             fk_project: "proj-1".to_string(),
             service: ServiceConfig {

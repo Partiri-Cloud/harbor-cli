@@ -12,16 +12,10 @@ use crate::config::PartiriConfig;
 use crate::error::{CliError, Result};
 use crate::output::{ctx, print_success};
 
-/// Deploy using the resolved local `.partiri.jsonc`. After the deploy is
-/// enqueued the local config is refreshed best-effort to pick up `deploy_tag`.
+/// Deploy using the resolved local `.partiri.jsonc`.
 pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let id = config.id_or_err()?;
     confirm_and_deploy(client, id, &config.service.name)?;
-
-    // Best-effort: pull the latest service state so `deploy_tag` becomes visible
-    // once the API has set it. Silent failure is fine — the deploy job runs async,
-    // so `deploy_tag` may not exist yet. `partiri llm next` re-checks via job status.
-    let _ = crate::modules::service::pull::silent_refresh(client, config);
 
     print_success("Deploy job created.");
     if !ctx().json {

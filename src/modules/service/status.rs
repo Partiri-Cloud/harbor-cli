@@ -94,7 +94,7 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let id = config.id_or_err()?;
 
     let service = client.read_service(id)?;
-    let deploy_tag = config.deploy_tag.as_deref();
+    let deploy_tag = service.deploy_tag.as_deref();
     let cpu_resp = client.read_metrics_cpu(id, deploy_tag);
     let mem_resp = client.read_metrics_memory(id, deploy_tag);
     let net_resp = client.read_metrics_network(id, deploy_tag);

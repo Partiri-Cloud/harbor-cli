@@ -270,7 +270,6 @@ mod tests {
     fn config_with_disk(pod: &str, disk: Option<DiskConfig>) -> PartiriConfig {
         PartiriConfig {
             id: Some("svc-1".into()),
-            deploy_tag: None,
             fk_workspace: "ws".into(),
             fk_project: "p".into(),
             service: ServiceConfig {

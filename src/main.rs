@@ -148,16 +148,8 @@ fn run(cli: Cli) -> error::Result<()> {
             match cmd {
                 ServiceCommands::Create => modules::service::create::run(&client, config)?,
                 ServiceCommands::Push => modules::service::push::run(&client, &config)?,
-                ServiceCommands::Metrics => {
-                    let refreshed =
-                        modules::service::pull::silent_refresh(&client, &config).unwrap_or(config);
-                    modules::service::status::run(&client, &refreshed)?
-                }
-                ServiceCommands::Logs => {
-                    let refreshed =
-                        modules::service::pull::silent_refresh(&client, &config).unwrap_or(config);
-                    modules::service::logs::run(&client, &refreshed)?
-                }
+                ServiceCommands::Metrics => modules::service::status::run(&client, &config)?,
+                ServiceCommands::Logs => modules::service::logs::run(&client, &config)?,
                 ServiceCommands::Jobs => modules::jobs::run_list(&client, &config)?,
                 ServiceCommands::Deploy { service: _ } => {
                     modules::service::deploy::run(&client, &config)?

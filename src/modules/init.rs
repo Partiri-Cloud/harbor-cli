@@ -760,7 +760,6 @@ pub fn run(args: InitArgs) -> Result<()> {
     // ── Assemble config ──
     let config = PartiriConfig {
         id: None,
-        deploy_tag: None,
         fk_workspace,
         fk_project,
         service: ServiceConfig {
@@ -812,7 +811,6 @@ pub fn run(args: InitArgs) -> Result<()> {
 fn write_template() -> Result<()> {
     let config = PartiriConfig {
         id: None,
-        deploy_tag: None,
         fk_workspace: String::new(),
         fk_project: String::new(),
         service: ServiceConfig {

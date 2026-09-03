@@ -462,7 +462,6 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | Field                             | Required  | Description                                                                 |
 |------------------------------------|-----------|-----------------------------------------------------------------------------|
 | `id`                               | Auto      | Service UUID. Set by `service create`; leave `null` initially.              |
-| `deploy_tag`                       | Auto      | Most recent deploy tag. Set by the deploy job; refresh with `service pull`. Needed for `logs` / `metrics`. |
 | `fk_workspace`                     | Yes       | UUID of the target workspace.                                               |
 | `fk_project`                       | Yes       | UUID of the target project. Must belong to `fk_workspace`.                  |
 | `service.name`                     | Yes       | Service name (≤16 chars), unique within the project.                        |
