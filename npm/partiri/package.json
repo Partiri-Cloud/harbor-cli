@@ -1,6 +1,6 @@
 {
   "name": "@partiri/cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Partiri CLI — Deploy and manage services on Partiri Cloud",
   "license": "MIT",
   "repository": {
@@ -12,9 +12,9 @@
     "partiri": "bin/partiri.js"
   },
   "optionalDependencies": {
-    "@partiri/cli-linux-x64": "0.5.0",
-    "@partiri/cli-linux-arm64": "0.5.0",
-    "@partiri/cli-darwin-x64": "0.5.0",
-    "@partiri/cli-darwin-arm64": "0.5.0"
+    "@partiri/cli-linux-x64": "0.5.1",
+    "@partiri/cli-linux-arm64": "0.5.1",
+    "@partiri/cli-darwin-x64": "0.5.1",
+    "@partiri/cli-darwin-arm64": "0.5.1"
   }
 }
