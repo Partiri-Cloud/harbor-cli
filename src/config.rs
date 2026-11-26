@@ -21,6 +21,17 @@ pub const CONFIG_FILE: &str = ".partiri.jsonc";
 /// invoked without `--config`, and by every test.
 static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: point [`PartiriConfig::config_path`] at `path` for this test thread.
+#[cfg(test)]
+pub(crate) fn set_test_config_path(path: PathBuf) {
+    TEST_CONFIG_PATH.with(|t| *t.borrow_mut() = Some(path));
+}
+
 /// Install the `--config` override, resolved via [`resolve_config_path`].
 /// Called once from `main`; later calls are no-ops (the `OnceLock` silently
 /// keeps whichever value was set first).
@@ -209,6 +220,11 @@ pub const RUNTIMES: &[&str] = &[
     "static", "registry",
 ];
 
+/// The Dockerfile-build runtime. Deliberately not in [`RUNTIMES`]: it is never
+/// offered by `init` or `llm template`, and is accepted only together with
+/// `github_app: true` (the API rejects it otherwise).
+pub const RUNTIME_DOCKERFILE: &str = "dockerfile";
+
 /// Maximum length of [`ServiceConfig::name`] in characters.
 pub const MAX_NAME_LEN: usize = 16;
 
@@ -272,6 +288,23 @@ pub struct ServiceConfig {
     )]
     #[schemars(rename = "service_secret")]
     pub service_secret: Option<String>,
+
+    /// Marker: this service deploys through the Partiri GitHub App (no access
+    /// token, deploys on push). Requires a GitHub `repository_url` and no
+    /// `service_secret` or `registry_url`. Only `true` is meaningful; `false`
+    /// reads as absent. Set by `partiri init`, `service pull` and
+    /// `service github connect`; change a live service's source only with
+    /// `partiri service github connect|disconnect`.
+    // Local marker, not a `services` column: the API writes the body straight to
+    // its own columns and an unknown key fails create/update, so this is
+    // deserialize-only for serde (the file itself is written by `to_jsonc_string`).
+    #[serde(default, skip_serializing)]
+    pub github_app: Option<bool>,
+    /// Deploy automatically on every push to `repository_branch` (GitHub App
+    /// services). A real column, sent when set. Left out of the file unless the
+    /// GitHub App path wrote it; when omitted on create, the API turns it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_deploy: Option<bool>,
 
     /// Output directory produced by `build_command` (e.g. `dist`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,6 +404,13 @@ pub struct ServiceConfig {
     #[schemars(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<Vec<EnvVar>>,
+}
+
+impl ServiceConfig {
+    /// True when the config asks for the GitHub App (`github_app: true`).
+    pub fn is_github_app(&self) -> bool {
+        self.github_app == Some(true)
+    }
 }
 
 /// Declarative disk (persistent volume) configuration within [`ServiceConfig`].
@@ -487,6 +527,10 @@ impl PartiriConfig {
     /// [`init_config_path`]) when set, otherwise `.partiri.jsonc` in the
     /// current working directory.
     pub fn config_path() -> PathBuf {
+        #[cfg(test)]
+        if let Some(p) = TEST_CONFIG_PATH.with(|t| t.borrow().clone()) {
+            return p;
+        }
         CONFIG_PATH_OVERRIDE
             .get()
             .cloned()
@@ -528,7 +572,13 @@ impl PartiriConfig {
             )
         };
 
+        let repo_section = format!("{repo_section}{}", github_lines(svc));
+
         let secret_line = match &svc.service_secret {
+            _ if svc.is_github_app() => {
+                "    // GitHub App services clone through the App and use no access token."
+                    .to_string()
+            }
             Some(id) => format!(
                 r#"    // Authentication token for private repository / registry access.
     "service_secret": {},"#,
@@ -748,6 +798,54 @@ impl PartiriConfig {
     }
 }
 
+/// The `github_app` / `auto_deploy` lines appended to the repository section.
+/// Empty for a config that has neither, so existing configs serialize exactly
+/// as before.
+fn github_lines(svc: &ServiceConfig) -> String {
+    let mut out = String::new();
+    if svc.is_github_app() {
+        out.push_str(
+            "\n    // Deploys through the Partiri GitHub App: no access token, deploys on every push.\n    // Change the source with 'partiri service github connect|disconnect'.\n    \"github_app\": true,",
+        );
+    }
+    if let Some(v) = svc.auto_deploy {
+        out.push_str(&format!(
+            "\n    // Deploy automatically on every push to the branch.\n    \"auto_deploy\": {v},"
+        ));
+    }
+    out
+}
+
+/// Anchor line of the repository section that `init --template` extends with a
+/// commented `github_app` hint.
+const TEMPLATE_GITHUB_ANCHOR: &str =
+    "    // \"registry_url\": null,           // not used when deploying from a repository";
+const TEMPLATE_GITHUB_HINT: &str = "    // \"github_app\": true,          // deploy through the Partiri GitHub App (no token); see 'partiri service github connect'";
+
+impl PartiriConfig {
+    /// The `init --template` scaffold: the normal serialization plus one
+    /// commented `github_app` line explaining the marker.
+    pub(crate) fn to_template_string(&self) -> Result<String> {
+        let data = self
+            .to_jsonc_string()
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        Ok(data.replacen(
+            TEMPLATE_GITHUB_ANCHOR,
+            &format!("{TEMPLATE_GITHUB_ANCHOR}\n{TEMPLATE_GITHUB_HINT}"),
+            1,
+        ))
+    }
+
+    /// Write the `init --template` scaffold to the active config path.
+    pub(crate) fn save_template(&self) -> Result<()> {
+        let data = self.to_template_string()?;
+        let path = Self::config_path();
+        crate::fsutil::write_private(&path, data.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
 /// Render an optional string as a JSON value: the quoted, escaped string when
 /// `Some`, or the literal `null` when `None`.
 pub(crate) fn json_opt_str(opt: &Option<String>) -> String {
@@ -805,9 +903,11 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
             format!("Must be: {}", DEPLOY_TYPES.join(" | "))
         },
     );
+    // `dockerfile` is accepted only on a GitHub App service, as the API does.
+    let is_dockerfile = svc.is_github_app() && svc.runtime == RUNTIME_DOCKERFILE;
     check(
         "runtime",
-        RUNTIMES.contains(&svc.runtime.as_str()),
+        RUNTIMES.contains(&svc.runtime.as_str()) || is_dockerfile,
         &format!("Must be: {}", RUNTIMES.join(" | ")),
     );
     check(
@@ -840,6 +940,10 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
         },
     );
 
+    if svc.is_github_app() {
+        check_github_app(svc, has_repo, has_reg, &mut check);
+    }
+
     // Static deploy type only supports repository
     if svc.deploy_type == "static" && has_reg {
         check(
@@ -849,8 +953,9 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
         );
     }
 
-    // Build / run commands required for repository-sourced services
-    if has_repo {
+    // Build / run commands required for repository-sourced services. A Dockerfile
+    // build has neither: the image defines how it builds and starts.
+    if has_repo && !is_dockerfile {
         let build_ok = svc
             .build_command
             .as_ref()
@@ -948,6 +1053,47 @@ pub fn validate_config(config: &PartiriConfig) -> Vec<ValidationResult> {
     }
 
     results
+}
+
+/// Extra checks for `github_app: true`. Never runs for a config without it, so
+/// those configs get exactly the results they always did.
+fn check_github_app(
+    svc: &ServiceConfig,
+    has_repo: bool,
+    has_reg: bool,
+    check: &mut impl FnMut(&str, bool, &str),
+) {
+    let parses = svc
+        .repository_url
+        .as_deref()
+        .is_some_and(|u| crate::modules::github::parse_github_repo(u).is_some());
+    check(
+        "github_app.repository_url",
+        has_repo && parses,
+        "github_app requires repository_url to be a GitHub repository (https://github.com/<owner>/<repo>)",
+    );
+    check(
+        "github_app.repository_branch",
+        svc.repository_branch
+            .as_deref()
+            .is_some_and(|b| !b.trim().is_empty()),
+        "github_app requires repository_branch (the branch whose pushes deploy)",
+    );
+    check(
+        "github_app.registry_url",
+        !has_reg,
+        "github_app services deploy from a repository: remove registry_url",
+    );
+    check(
+        "github_app.service_secret",
+        svc.service_secret.as_deref().is_none_or(str::is_empty),
+        "GitHub App services don't use an access token: remove service_secret",
+    );
+    check(
+        "github_app.deploy_type",
+        !matches!(svc.deploy_type.as_str(), "database" | "registry"),
+        "github_app is not available for database or registry services",
+    );
 }
 
 #[cfg(test)]
@@ -1859,5 +2005,205 @@ mod tests {
         // test in this binary, so setting it here would leak into — and
         // poison — every other (parallel) test that reads `config_path()`.
         assert_eq!(PartiriConfig::config_path(), PathBuf::from(CONFIG_FILE));
+    }
+
+    // ─── GitHub App fields ────────────────────────────────────────────────────
+
+    fn github_service() -> PartiriConfig {
+        let mut c = valid_webservice();
+        c.service.github_app = Some(true);
+        c.service.runtime = "node".into();
+        c
+    }
+
+    fn failing(c: &PartiriConfig) -> Vec<String> {
+        validate_config(c)
+            .into_iter()
+            .filter(|r| !r.ok)
+            .map(|r| r.field)
+            .collect()
+    }
+
+    #[test]
+    fn old_config_without_github_fields_parses_validates_and_serializes_as_before() {
+        let old = r#"{
+          "id": null, "workspace": "w", "project": "p",
+          "service": {
+            "name": "svc", "deploy_type": "webservice", "runtime": "node", "root_path": ".",
+            "repository_url": "https://github.com/o/r", "repository_branch": "main",
+            "build_command": "npm run build", "run_command": "npm start",
+            "region": "r", "pod": "p", "maintenance_mode": false, "active": true
+          }
+        }"#;
+        let cfg = PartiriConfig::parse_str(old).unwrap();
+        assert!(cfg.service.github_app.is_none() && cfg.service.auto_deploy.is_none());
+        assert!(validate_config(&cfg).iter().all(|r| r.ok));
+        assert!(validate_config(&cfg)
+            .iter()
+            .all(|r| !r.field.starts_with("github_app")));
+        let text = cfg.to_jsonc_string().unwrap();
+        assert!(
+            !text.contains("github_app") && !text.contains("auto_deploy"),
+            "{text}"
+        );
+        // The repository and token sections are byte-for-byte what they were.
+        assert!(
+            text.contains(concat!(
+                "    \"repository_url\": \"https://github.com/o/r\",\n",
+                "    \"repository_branch\": \"main\",\n",
+                "    // \"registry_url\": null,           // not used when deploying from a repository\n",
+                "\n",
+                "    // Authentication token for private repository / registry access.\n",
+                "    // \"service_secret\": \"uuid\",     // run 'partiri service token' to configure\n",
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn template_adds_one_commented_github_app_line_and_nothing_else() {
+        let cfg = valid_webservice();
+        let plain = cfg.to_jsonc_string().unwrap();
+        let template = cfg.to_template_string().unwrap();
+        let extra: Vec<&str> = template
+            .lines()
+            .filter(|l| !plain.lines().any(|p| p == *l))
+            .collect();
+        assert_eq!(extra.len(), 1, "{extra:?}");
+        assert!(
+            extra[0].trim_start().starts_with("// \"github_app\": true"),
+            "{extra:?}"
+        );
+        assert!(PartiriConfig::parse_str(&template).is_ok());
+    }
+
+    #[test]
+    fn github_app_false_serializes_and_validates_like_absent() {
+        let plain = valid_webservice();
+        let mut off = valid_webservice();
+        off.service.github_app = Some(false);
+        assert_eq!(
+            plain.to_jsonc_string().unwrap(),
+            off.to_jsonc_string().unwrap()
+        );
+        assert_eq!(failing(&plain), failing(&off));
+        assert_eq!(validate_config(&plain).len(), validate_config(&off).len());
+    }
+
+    #[test]
+    fn github_app_true_is_written_and_survives_a_round_trip() {
+        let mut cfg = github_service();
+        cfg.service.auto_deploy = Some(true);
+        let text = cfg.to_jsonc_string().unwrap();
+        assert!(text.contains("\"github_app\": true,"), "{text}");
+        assert!(text.contains("\"auto_deploy\": true,"), "{text}");
+        let back = PartiriConfig::parse_str(&text).unwrap();
+        assert_eq!(back.service.github_app, Some(true));
+        assert_eq!(back.service.auto_deploy, Some(true));
+        assert_eq!(back.to_jsonc_string().unwrap(), text);
+    }
+
+    #[test]
+    fn auto_deploy_false_is_written_and_parsed() {
+        let mut cfg = github_service();
+        cfg.service.auto_deploy = Some(false);
+        let back = PartiriConfig::parse_str(&cfg.to_jsonc_string().unwrap()).unwrap();
+        assert_eq!(back.service.auto_deploy, Some(false));
+    }
+
+    #[test]
+    fn github_app_never_serializes_into_an_api_body() {
+        let mut cfg = github_service();
+        cfg.service.auto_deploy = Some(true);
+        let v = serde_json::to_value(&cfg.service).unwrap();
+        assert!(v.get("github_app").is_none(), "{v}");
+        assert_eq!(v["auto_deploy"], true);
+        let v = serde_json::to_value(&valid_webservice().service).unwrap();
+        assert!(
+            v.get("github_app").is_none() && v.get("auto_deploy").is_none(),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn github_app_valid_config_passes() {
+        assert!(
+            failing(&github_service()).is_empty(),
+            "{:?}",
+            failing(&github_service())
+        );
+    }
+
+    #[test]
+    fn github_app_requires_a_github_repository_url() {
+        for url in ["https://gitlab.com/o/r", "https://github.com/o", ""] {
+            let mut c = github_service();
+            c.service.repository_url = Some(url.into());
+            assert!(
+                failing(&c).contains(&"github_app.repository_url".to_string()),
+                "{url}"
+            );
+        }
+        let mut c = github_service();
+        c.service.repository_url = None;
+        c.service.registry_url = Some("ghcr.io/a/b:1".into());
+        let f = failing(&c);
+        assert!(
+            f.contains(&"github_app.repository_url".to_string()),
+            "{f:?}"
+        );
+        assert!(f.contains(&"github_app.registry_url".to_string()), "{f:?}");
+    }
+
+    #[test]
+    fn github_app_rejects_a_token_a_missing_branch_and_database_types() {
+        let mut c = github_service();
+        c.service.service_secret = Some("tok".into());
+        assert!(failing(&c).contains(&"github_app.service_secret".to_string()));
+        let mut c = github_service();
+        c.service.repository_branch = None;
+        assert!(failing(&c).contains(&"github_app.repository_branch".to_string()));
+        for dt in ["database", "registry"] {
+            let mut c = github_service();
+            c.service.deploy_type = dt.into();
+            assert!(
+                failing(&c).contains(&"github_app.deploy_type".to_string()),
+                "{dt}"
+            );
+        }
+    }
+
+    #[test]
+    fn dockerfile_runtime_is_valid_only_with_github_app() {
+        let mut c = github_service();
+        c.service.runtime = "dockerfile".into();
+        c.service.build_command = None;
+        assert!(failing(&c).is_empty(), "{:?}", failing(&c));
+        c.service.github_app = None;
+        assert!(failing(&c).contains(&"runtime".to_string()));
+        assert!(!RUNTIMES.contains(&RUNTIME_DOCKERFILE));
+    }
+
+    #[test]
+    fn github_app_config_hides_the_token_hint_in_the_file() {
+        let text = github_service().to_jsonc_string().unwrap();
+        assert!(text.contains("use no access token"), "{text}");
+        assert!(
+            !text.contains("run 'partiri service token' to configure"),
+            "{text}"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn configs_without_github_app_never_get_github_checks(
+            name in "[a-z]{1,16}",
+            secret in proptest::option::of("[a-z0-9-]{8,12}"),
+        ) {
+            let mut c = valid_webservice();
+            c.service.name = name;
+            c.service.service_secret = secret;
+            prop_assert!(validate_config(&c).iter().all(|r| !r.field.starts_with("github_app")));
+        }
     }
 }

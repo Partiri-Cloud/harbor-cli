@@ -52,6 +52,9 @@ pub fn run(client: &ApiClient, mut config: PartiriConfig, args: LinkArgs) -> Res
 }
 
 fn run_with_flags(mut config: PartiriConfig, args: LinkArgs) -> Result<()> {
+    if args.token.is_some() && config.service.is_github_app() {
+        return Err(Box::new(crate::modules::service::token::app_token_error()));
+    }
     if args.workspace.is_some() && args.project.is_none() {
         return Err(
             "--workspace requires --project (projects don't carry across workspaces).".into(),
@@ -180,4 +183,39 @@ fn run_interactive(client: &ApiClient, config: &mut PartiriConfig) -> Result<()>
     config.save()?;
     print_success(&format!("{} updated.", crate::config::config_display()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_config() -> PartiriConfig {
+        PartiriConfig {
+            id: Some("svc-1".into()),
+            workspace: "ws-1".into(),
+            project: "p".into(),
+            service: crate::config::ServiceConfig {
+                github_app: Some(true),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn link_token_on_an_app_config_is_refused() {
+        let args = LinkArgs {
+            workspace: None,
+            project: None,
+            region: None,
+            pod: None,
+            token: Some("tok".into()),
+            clear_token: false,
+        };
+        let err = run_with_flags(app_config(), args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("GitHub App services don't use an access token"),
+            "{err}"
+        );
+    }
 }

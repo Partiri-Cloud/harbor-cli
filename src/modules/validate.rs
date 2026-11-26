@@ -169,7 +169,12 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
     }
 
     // ── Repo source reachability ─────────────────────────────────────────────
-    if let Some(repo_url) = config
+    if config.service.is_github_app() {
+        match config.id.as_deref() {
+            Some(id) => rows.extend(github_live_checks(client, config, id)),
+            None => rows.extend(github_app_checks(client, config)),
+        }
+    } else if let Some(repo_url) = config
         .service
         .repository_url
         .as_deref()
@@ -313,6 +318,108 @@ pub(crate) fn collect_remote_checks(client: &ApiClient, config: &PartiriConfig) 
     rows
 }
 
+/// Remote checks for a `github_app: true` config whose service already exists.
+/// Running App services keep working after onboarding closes, so the onboarding
+/// resolver is not used: the live service is checked instead (still an App
+/// service, same repository, not disconnected).
+fn github_live_checks(client: &ApiClient, config: &PartiriConfig, id: &str) -> Vec<CheckRow> {
+    use crate::modules::github::parse_github_repo;
+
+    let live = match client.read_service(id) {
+        Ok(l) => l,
+        Err(e) => {
+            return vec![CheckRow::warn(
+                "remote.github_repo",
+                &format!("could not read the live service: {e}"),
+            )]
+        }
+    };
+    if !live.is_github_app() {
+        return vec![CheckRow::fail(
+            "remote.github_repo",
+            "the live service is not connected to the GitHub App. Run 'partiri service github connect', or remove github_app from the config.",
+        )];
+    }
+    let wanted = config
+        .service
+        .repository_url
+        .as_deref()
+        .and_then(parse_github_repo)
+        .map(|r| r.full_name());
+    let live_name = live.github_repo_full_name.clone().unwrap_or_default();
+    if wanted
+        .as_deref()
+        .is_some_and(|w| !w.eq_ignore_ascii_case(&live_name))
+    {
+        return vec![CheckRow::fail(
+            "remote.github_repo",
+            &format!(
+                "the live service deploys {live_name}, not {}. Run 'partiri service pull' to refresh the config, or 'partiri service github connect --repo ...' to change the repository.",
+                wanted.unwrap_or_default()
+            ),
+        )];
+    }
+    if live.github_disconnected_at.is_some() {
+        return vec![CheckRow::warn(
+            "remote.github_repo",
+            &format!("{live_name} lost its GitHub App access: pushes don't deploy and redeploys fail. Restore the access on GitHub, then run 'partiri service github connect'."),
+        )];
+    }
+    vec![CheckRow::ok(
+        "remote.github_repo",
+        &format!("{live_name} is connected through the GitHub App"),
+    )]
+}
+
+/// Remote checks for a `github_app: true` config, replacing the token-based
+/// reachability probe: the GitHub identity, the repository in the workspace's
+/// linked installations, and the branch.
+fn github_app_checks(client: &ApiClient, config: &PartiriConfig) -> Vec<CheckRow> {
+    use crate::modules::github::{check_branch, parse_github_repo, resolve_repo};
+
+    let svc = &config.service;
+    let Some(repo) = svc.repository_url.as_deref().and_then(parse_github_repo) else {
+        return Vec::new();
+    };
+    let full = repo.full_name();
+    let resolved = match resolve_repo(client, &config.workspace, &full, false) {
+        Ok(r) => r,
+        Err(e) => {
+            let identity = e
+                .downcast_ref::<CliError>()
+                .and_then(|c| c.api_code.as_deref())
+                == Some("github_identity_required");
+            let field = if identity {
+                "remote.github_identity"
+            } else {
+                "remote.github_repo"
+            };
+            return vec![CheckRow::fail(field, &e.to_string())];
+        }
+    };
+    let mut rows = vec![
+        CheckRow::ok("remote.github_identity", "GitHub account connected"),
+        CheckRow::ok(
+            "remote.github_repo",
+            &format!(
+                "{} reachable through the GitHub App ({})",
+                resolved.repo.full_name, resolved.installation.account_login
+            ),
+        ),
+    ];
+    let Some(branch) = svc.repository_branch.as_deref().filter(|b| !b.is_empty()) else {
+        return rows;
+    };
+    match check_branch(client, &resolved.link_id, resolved.repo.id, branch) {
+        Ok(_) => rows.push(CheckRow::ok(
+            "remote.github_branch",
+            "branch exists in the repository",
+        )),
+        Err(e) => rows.push(CheckRow::fail("remote.github_branch", &e.to_string())),
+    }
+    rows
+}
+
 // ─── Internal row helper ─────────────────────────────────────────────────────
 
 pub(crate) enum Status {
@@ -429,5 +536,151 @@ mod tests {
         let amount = 0.01_f64;
         let status = if amount <= 0.0 { "warn" } else { "ok" };
         assert_eq!(status, "ok");
+    }
+
+    // ─── GitHub App remote checks ─────────────────────────────────────────────
+
+    fn app_config() -> PartiriConfig {
+        PartiriConfig {
+            id: None,
+            workspace: "ws-1".into(),
+            project: "p".into(),
+            service: crate::config::ServiceConfig {
+                repository_url: Some("https://github.com/acme/web".into()),
+                repository_branch: Some("main".into()),
+                github_app: Some(true),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn fields(rows: &[CheckRow]) -> Vec<(&str, bool)> {
+        rows.iter()
+            .map(|r| (r.field.as_str(), r.is_fail()))
+            .collect()
+    }
+
+    #[test]
+    fn github_checks_report_identity_repo_and_branch() {
+        use httpmock::prelude::*;
+        use serde_json::json;
+        let server = MockServer::start();
+        crate::modules::github::test_support::mock_config(&server);
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/me");
+            then.status(200).json_body(json!({"connected": true}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/installations");
+            then.status(200).json_body(json!([
+                {"id": "i", "link_id": "link-a", "account_login": "acme"}
+            ]));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/integrations/github/installations/link-a/repositories");
+            then.status(200)
+                .json_body(json!({"items": [{"id": 42, "full_name": "acme/web"}]}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/integrations/github/repositories/42/branches");
+            then.status(200)
+                .json_body(json!([{"name": "dev", "default": true}]));
+        });
+        let client = ApiClient::for_test(server.base_url());
+        let rows = github_app_checks(&client, &app_config());
+        assert_eq!(
+            fields(&rows),
+            vec![
+                ("remote.github_identity", false),
+                ("remote.github_repo", false),
+                ("remote.github_branch", true)
+            ]
+        );
+        assert!(rows[2].message.contains("dev"), "{}", rows[2].message);
+    }
+
+    #[test]
+    fn github_checks_stop_at_a_missing_identity() {
+        use httpmock::prelude::*;
+        use serde_json::json;
+        let server = MockServer::start();
+        crate::modules::github::test_support::mock_config(&server);
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/me");
+            then.status(200)
+                .json_body(json!({"connected": true, "reauth_required": true}));
+        });
+        let client = ApiClient::for_test(server.base_url());
+        let rows = github_app_checks(&client, &app_config());
+        assert_eq!(fields(&rows), vec![("remote.github_identity", true)]);
+    }
+
+    fn live_server(live: serde_json::Value) -> httpmock::MockServer {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/services/svc-1");
+            then.status(200).json_body(live);
+        });
+        server
+    }
+
+    fn created_app_config() -> PartiriConfig {
+        let mut c = app_config();
+        c.id = Some("svc-1".into());
+        c
+    }
+
+    fn live_json(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "id": "svc-1", "name": "web", "deploy_type": "webservice", "runtime": "node",
+            "github_repo_id": 42, "github_repo_full_name": "acme/web"
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    }
+
+    #[test]
+    fn created_app_service_is_checked_live_without_the_onboarding_resolver() {
+        let server = live_server(live_json(serde_json::json!({})));
+        let config = server.mock(|when, then| {
+            when.any_request();
+            then.status(404);
+        });
+        let client = ApiClient::for_test(server.base_url());
+        let rows = github_live_checks(&client, &created_app_config(), "svc-1");
+        assert_eq!(fields(&rows), vec![("remote.github_repo", false)]);
+        config.assert_calls(0);
+    }
+
+    #[test]
+    fn created_app_service_that_is_no_longer_an_app_service_fails() {
+        let server = live_server(live_json(serde_json::json!({"github_repo_id": null})));
+        let client = ApiClient::for_test(server.base_url());
+        let rows = github_live_checks(&client, &created_app_config(), "svc-1");
+        assert_eq!(fields(&rows), vec![("remote.github_repo", true)]);
+    }
+
+    #[test]
+    fn created_app_service_on_another_repo_fails_and_a_disconnected_one_warns() {
+        let server = live_server(live_json(
+            serde_json::json!({"github_repo_full_name": "acme/other"}),
+        ));
+        let client = ApiClient::for_test(server.base_url());
+        let rows = github_live_checks(&client, &created_app_config(), "svc-1");
+        assert_eq!(fields(&rows), vec![("remote.github_repo", true)]);
+
+        let server = live_server(live_json(
+            serde_json::json!({"github_disconnected_at": "2026-11-01T00:00:00Z"}),
+        ));
+        let client = ApiClient::for_test(server.base_url());
+        let rows = github_live_checks(&client, &created_app_config(), "svc-1");
+        assert_eq!(fields(&rows), vec![("remote.github_repo", false)]);
+        assert!(matches!(rows[0].status, Status::Warn));
+        assert!(rows[0].message.contains("service github connect"));
     }
 }

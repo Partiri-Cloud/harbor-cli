@@ -67,6 +67,9 @@ pub enum Commands {
     /// Manage managed PostgreSQL databases
     #[command(subcommand, visible_alias = "database")]
     Db(DbCommands),
+    /// GitHub App integration: connection status, setup, repositories
+    #[command(subcommand)]
+    Github(GithubCommands),
     /// Manage workspace secrets (registry and repository credentials)
     #[command(subcommand)]
     Secrets(SecretsCommands),
@@ -230,6 +233,80 @@ pub enum ServiceCommands {
         /// Clear service_secret on this service.
         #[arg(long)]
         clear: bool,
+    },
+    /// Connect this service to the GitHub App, or disconnect it
+    #[command(subcommand)]
+    Github(ServiceGithubCommands),
+    /// Pull-request preview environments (default: show)
+    Previews {
+        #[command(subcommand)]
+        cmd: Option<PreviewsCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServiceGithubCommands {
+    /// Clone through the GitHub App instead of an access token (requires confirmation)
+    ///
+    /// Defaults to the service's current repository and branch. Redeploys the
+    /// service and makes every push to the branch deploy it.
+    Connect {
+        /// Repository as `owner/repo` (or a GitHub URL). Defaults to the live repository_url.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Branch to deploy. Defaults to the live branch, or the repo's default branch when --repo changes the repo.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+    },
+    /// Stop deploying through the GitHub App (requires confirmation)
+    Disconnect,
+}
+
+#[derive(Subcommand)]
+pub enum PreviewsCommands {
+    /// Show the preview settings and the live previews
+    Show,
+    /// Turn previews on (a month is charged per preview; requires confirmation)
+    Enable {
+        /// Pod previews run on. Defaults to the current setting, else the service's pod.
+        #[arg(long, value_name = "UUID")]
+        pod: Option<String>,
+        /// Give previews this service's secrets too (pull requests from branches of the repo).
+        #[arg(long = "share-secrets", conflicts_with = "no_share_secrets")]
+        share_secrets: bool,
+        /// Do not give previews this service's secrets.
+        #[arg(long = "no-share-secrets")]
+        no_share_secrets: bool,
+    },
+    /// Turn previews off and remove every preview environment (requires confirmation)
+    Disable,
+}
+
+#[derive(Subcommand)]
+pub enum GithubCommands {
+    /// Show GitHub App availability, the connection, and the linked accounts
+    Status {
+        /// Workspace UUID. Defaults to the config's workspace.
+        #[arg(long, value_name = "UUID")]
+        workspace: Option<String>,
+    },
+    /// Open the dashboard to connect GitHub and install the App, then re-check
+    Setup {
+        /// Workspace UUID. Defaults to the config's workspace.
+        #[arg(long, value_name = "UUID")]
+        workspace: Option<String>,
+    },
+    /// List repositories the GitHub App can see, across linked accounts
+    Repos {
+        /// Workspace UUID. Defaults to the config's workspace.
+        #[arg(long, value_name = "UUID")]
+        workspace: Option<String>,
+        /// Only repositories whose `owner/repo` contains this text.
+        #[arg(long, value_name = "TEXT")]
+        search: Option<String>,
+        /// Page of results per linked account (100 per page). Default 1.
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        page: u32,
     },
 }
 
@@ -464,7 +541,7 @@ pub enum LlmCommands {
         /// `node` (default), `rust`, `python`, … `registry`. See `llm schema`.
         #[arg(long)]
         runtime: Option<String>,
-        /// `repo` (default) or `registry`.
+        /// `repo` (default), `github` (GitHub App), or `registry`.
         #[arg(long)]
         source: Option<String>,
     },

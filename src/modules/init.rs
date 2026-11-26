@@ -421,7 +421,7 @@ pub(crate) fn prompt_for_pod(
         .map_err(|_| "Cancelled.".into())
 }
 
-fn prompt_for_token(
+pub(crate) fn prompt_for_token(
     client: Option<&ApiClient>,
     workspace_id: &str,
     source_kind: &str,
@@ -469,6 +469,150 @@ fn prompt_for_token(
     let choice = Select::new("Select token:", labels.clone()).prompt().ok()?;
     let idx = labels.iter().position(|l| l == &choice)?;
     Some(secrets[idx].id.clone())
+}
+
+// ─── GitHub App access question ───────────────────────────────────────────────
+
+/// How the user chose to give Partiri access to a GitHub repository.
+enum RepoAccess {
+    /// The GitHub App: canonical repository URL and the verified branch.
+    App { url: String, branch: String },
+    /// An access token (the existing token prompt).
+    Token,
+    /// No credentials (public repository).
+    NoToken,
+}
+
+const OPT_APP: &str = "GitHub App: no token, deploys on every push (recommended)";
+const OPT_TOKEN: &str = "Access token";
+const OPT_PUBLIC: &str = "No token (public repository)";
+const RETRY_CHECK: &str = "Check again";
+const RETRY_TOKEN: &str = "Use an access token instead";
+const RETRY_PUBLIC: &str = "No token";
+
+/// Ask how Partiri should access a GitHub repository. Returns `None` — with no
+/// prompt and no API call beyond the availability probe — unless the source is
+/// a GitHub repository, an API client exists, and the GitHub App is available
+/// in the workspace; then the wizard is exactly what it always was.
+fn ask_repo_access(
+    client: Option<&ApiClient>,
+    workspace: &str,
+    repo_url: Option<&str>,
+    branch: Option<&str>,
+) -> Result<Option<RepoAccess>> {
+    let (Some(client), Some(url)) = (client, repo_url) else {
+        return Ok(None);
+    };
+    let Some(repo) = crate::modules::github::parse_github_repo(url) else {
+        return Ok(None);
+    };
+    if !crate::modules::github::app_available(client, workspace) {
+        return Ok(None);
+    }
+    let full = repo.full_name();
+    let choice = Select::new(
+        &format!("How should Partiri access {full}?"),
+        vec![OPT_APP, OPT_TOKEN, OPT_PUBLIC],
+    )
+    .prompt()
+    .map_err(|_| "Cancelled.")?;
+    Ok(Some(match choice {
+        OPT_APP => connect_app(client, workspace, &full, branch.unwrap_or("main"))?,
+        OPT_TOKEN => RepoAccess::Token,
+        _ => RepoAccess::NoToken,
+    }))
+}
+
+/// Errors that end in the "Check again / token / no token" choice rather than
+/// the unexpected-error fallback.
+fn offers_choice(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("github_repo_not_accessible" | "installation_suspended")
+    )
+}
+
+/// Walk the GitHub App path until it succeeds or the user picks another way.
+/// An unexpected API error is printed once and falls back to the token prompt:
+/// `init` never aborts because of GitHub.
+fn connect_app(
+    client: &ApiClient,
+    workspace: &str,
+    full_name: &str,
+    branch: &str,
+) -> Result<RepoAccess> {
+    use crate::modules::github as gh;
+
+    let mut refresh = false;
+    let mut opened = false;
+    loop {
+        match try_app(client, workspace, full_name, branch, refresh) {
+            Ok(access) => return Ok(access),
+            Err(e) => {
+                let code = e
+                    .downcast_ref::<crate::error::CliError>()
+                    .and_then(|c| c.api_code.clone());
+                let identity = code.as_deref() == Some("github_identity_required");
+                if !identity && !offers_choice(code.as_deref()) {
+                    print_warning(&format!("GitHub App setup failed: {e}"));
+                    return Ok(RepoAccess::Token);
+                }
+                println!("\n  {}", e.to_string().yellow());
+                if identity && !opened {
+                    let url = gh::dashboard_url(workspace);
+                    println!("  Opening {} in your browser.", url.bold());
+                    let _ = webbrowser::open(&url);
+                    opened = true;
+                    let _ = Confirm::new("Press Enter once GitHub is connected")
+                        .with_default(true)
+                        .prompt();
+                    continue;
+                }
+                match Select::new("What now?", vec![RETRY_CHECK, RETRY_TOKEN, RETRY_PUBLIC])
+                    .prompt()
+                    .map_err(|_| "Cancelled.")?
+                {
+                    RETRY_CHECK => refresh = true,
+                    RETRY_TOKEN => return Ok(RepoAccess::Token),
+                    _ => return Ok(RepoAccess::NoToken),
+                }
+            }
+        }
+    }
+}
+
+fn try_app(
+    client: &ApiClient,
+    workspace: &str,
+    full_name: &str,
+    branch: &str,
+    refresh: bool,
+) -> Result<RepoAccess> {
+    use crate::modules::github as gh;
+
+    let resolved = gh::resolve_repo(client, workspace, full_name, refresh)?;
+    let branches = gh::fetch_branches(client, &resolved.link_id, resolved.repo.id)?;
+    let branch = if branches.iter().any(|b| b.name == branch) {
+        branch.to_string()
+    } else {
+        let names: Vec<String> = branches.iter().map(|b| b.name.clone()).collect();
+        println!(
+            "  Branch '{branch}' doesn't exist in {}.",
+            resolved.repo.full_name
+        );
+        Select::new("Branch to deploy (default first):", names)
+            .prompt()
+            .map_err(|_| "Cancelled.")?
+    };
+    println!(
+        "  Pushes to {} will deploy automatically ({}).",
+        branch.bold(),
+        "auto_deploy".dimmed()
+    );
+    Ok(RepoAccess::App {
+        url: format!("https://github.com/{}", resolved.repo.full_name),
+        branch,
+    })
 }
 
 // ─── Main init flow ───────────────────────────────────────────────────────────
@@ -641,7 +785,32 @@ pub fn run(args: InitArgs) -> Result<()> {
     } else {
         "repository"
     };
-    let service_secret = prompt_for_token(client.as_ref(), &workspace, source_kind);
+    let access = if is_registry {
+        None
+    } else {
+        ask_repo_access(
+            client.as_ref(),
+            &workspace,
+            repository_url.as_deref(),
+            repository_branch.as_deref(),
+        )?
+    };
+    let mut github_app = None;
+    let mut auto_deploy = None;
+    let (mut repository_url, mut repository_branch) = (repository_url, repository_branch);
+    let service_secret = match access {
+        Some(RepoAccess::App { url, branch }) => {
+            github_app = Some(true);
+            auto_deploy = Some(true);
+            repository_url = Some(url);
+            repository_branch = Some(branch);
+            None
+        }
+        Some(RepoAccess::NoToken) => None,
+        Some(RepoAccess::Token) | None => {
+            prompt_for_token(client.as_ref(), &workspace, source_kind)
+        }
+    };
 
     // ── Runtime ──
     // For registry images the runtime is implicit — no selection needed.
@@ -771,6 +940,8 @@ pub fn run(args: InitArgs) -> Result<()> {
             repository_branch,
             registry_url,
             service_secret,
+            github_app,
+            auto_deploy,
             build_path,
             build_command,
             pre_deploy_command: None,
@@ -836,7 +1007,7 @@ fn write_template() -> Result<()> {
             ..Default::default()
         },
     };
-    config.save()?;
+    config.save_template()?;
 
     if crate::output::ctx().json {
         let path = crate::config::config_display();
@@ -1048,6 +1219,114 @@ mod build_pod_choices_tests {
         assert_eq!(labels.len(), sorted.len());
         for (label, p) in labels.iter().zip(&sorted) {
             assert!(label.ends_with(&format!("({})", p.id)), "{}", label);
+        }
+    }
+}
+
+#[cfg(test)]
+mod github_access_tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    #[test]
+    fn no_question_and_no_api_call_without_a_client_or_a_github_url() {
+        assert!(
+            ask_repo_access(None, "ws", Some("https://github.com/a/b"), Some("main"))
+                .unwrap()
+                .is_none()
+        );
+        let server = MockServer::start();
+        let any = server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+        let client = ApiClient::for_test(server.base_url());
+        for url in [None, Some("https://gitlab.com/a/b"), Some("not a url")] {
+            assert!(ask_repo_access(Some(&client), "ws", url, Some("main"))
+                .unwrap()
+                .is_none());
+        }
+        any.assert_calls(0);
+    }
+
+    #[test]
+    fn unreachable_and_suspended_repos_lead_to_the_choice_not_the_fallback() {
+        assert!(offers_choice(Some("github_repo_not_accessible")));
+        assert!(offers_choice(Some("installation_suspended")));
+        assert!(!offers_choice(Some("github_unavailable")));
+        assert!(!offers_choice(None));
+    }
+
+    #[test]
+    fn no_question_when_the_app_is_unavailable() {
+        let server = MockServer::start();
+        let cfg = server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/config");
+            then.status(404).body("Not Found");
+        });
+        let other = server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/me");
+            then.status(200).json_body(json!({}));
+        });
+        let client = ApiClient::for_test(server.base_url());
+        let got = ask_repo_access(
+            Some(&client),
+            "ws",
+            Some("https://github.com/a/b"),
+            Some("main"),
+        );
+        assert!(got.unwrap().is_none());
+        cfg.assert_calls(1);
+        other.assert_calls(0);
+    }
+
+    #[test]
+    fn no_question_when_the_app_is_disabled_for_the_workspace() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/config");
+            then.status(200)
+                .json_body(json!({"enabled": false, "previews_enabled": false, "dockerfile_builds_enabled": false}));
+        });
+        let client = ApiClient::for_test(server.base_url());
+        let got = ask_repo_access(Some(&client), "ws", Some("git@github.com:a/b.git"), None);
+        assert!(got.unwrap().is_none());
+    }
+
+    #[test]
+    fn app_path_returns_the_canonical_url_and_the_verified_branch() {
+        let server = MockServer::start();
+        crate::modules::github::test_support::mock_config(&server);
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/me");
+            then.status(200).json_body(json!({"connected": true}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/installations");
+            then.status(200).json_body(json!([
+                {"id": "i", "link_id": "link-a", "account_login": "acme"}
+            ]));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/integrations/github/installations/link-a/repositories");
+            then.status(200)
+                .json_body(json!({"items": [{"id": 42, "full_name": "Acme/Web"}]}));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/integrations/github/repositories/42/branches");
+            then.status(200)
+                .json_body(json!([{"name": "main", "default": true}]));
+        });
+        let client = ApiClient::for_test(server.base_url());
+        match try_app(&client, "ws", "acme/web", "main", false).unwrap() {
+            RepoAccess::App { url, branch } => {
+                assert_eq!(url, "https://github.com/Acme/Web");
+                assert_eq!(branch, "main");
+            }
+            _ => panic!("expected the App path"),
         }
     }
 }

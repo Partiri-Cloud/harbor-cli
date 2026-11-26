@@ -367,6 +367,7 @@ pub fn run_jobs(client: &ApiClient, id: &str) -> Result<()> {
                 .as_deref()
                 .map(format_datetime)
                 .unwrap_or_else(|| "—".to_string()),
+            trigger: None,
         })
         .collect();
 

@@ -4,10 +4,12 @@
 pub mod create;
 pub mod deploy;
 pub mod env;
+pub mod github;
 pub mod kill;
 pub mod link;
 pub mod logs;
 pub mod pause;
+pub mod previews;
 pub mod pull;
 pub mod push;
 pub mod status;

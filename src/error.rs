@@ -22,6 +22,11 @@ pub const SCHEMA_VERSION: &str = "1";
 #[derive(Debug, Clone, Serialize)]
 pub struct CliError {
     pub code: String,
+    /// Machine-readable code from the API's `error` field, set only for the
+    /// allowlisted GitHub integration codes ([`API_ERROR_HINTS`]). `code` keeps
+    /// the HTTP status so existing consumers are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub api_code: Option<String>,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -37,6 +42,7 @@ impl CliError {
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
+            api_code: None,
             message: message.into(),
             hint: None,
             likely_causes: Vec::new(),
@@ -56,10 +62,19 @@ impl CliError {
         self
     }
 
+    /// Attach the API's machine-readable error code (see [`API_ERROR_HINTS`]).
+    pub fn with_api_code(mut self, api_code: impl Into<String>) -> Self {
+        self.api_code = Some(api_code.into());
+        self
+    }
+
     /// Fill `likely_causes` and `suggested_commands` from the per-code lookup
-    /// table. No-op when the code has no entry.
+    /// table: keyed on `api_code` when the API sent one, else on `code`. A coded
+    /// error never takes the generic per-status entry (a 409
+    /// `preview_service_managed` is not a conflicting operation). No-op when
+    /// the key has no entry.
     pub fn enriched(mut self) -> Self {
-        let (causes, suggestions) = lookup_metadata(&self.code);
+        let (causes, suggestions) = lookup_metadata(self.api_code.as_deref().unwrap_or(&self.code));
         if self.likely_causes.is_empty() {
             self.likely_causes = causes;
         }
@@ -101,6 +116,40 @@ pub fn extract_cli_error(err: &(dyn std::error::Error + 'static)) -> CliError {
         return c.clone();
     }
     CliError::new("error", err.to_string()).enriched()
+}
+
+/// The API error codes (the `error` field of a 4xx/5xx body) the CLI maps, with
+/// the hint shown instead of the generic per-status one. Any other `error`
+/// value is an HTTP reason phrase ("Forbidden") and must not be read as a code.
+pub const API_ERROR_HINTS: &[(&str, &str)] = &[
+    ("github_app_disabled", "The GitHub integration isn't available in this workspace."),
+    ("github_identity_required", "Connect your GitHub account first. The API key's owner has to do it, in the dashboard: workspace settings -> GitHub card (CLI: 'partiri github setup'). If it was connected before, the authorization has expired: connect it again."),
+    ("github_installation_forbidden", "Your GitHub account has no access to that GitHub App installation."),
+    ("github_repo_not_accessible", "The Partiri GitHub App, or your GitHub account, can't see this repository. Grant the App access to it on GitHub (the installation's \"configure repository access\" page), then retry."),
+    ("github_branch_not_found", "That branch doesn't exist in the repository."),
+    ("github_registry_switch_forbidden", "This service deploys from GitHub. Disconnect it first ('partiri service github disconnect')."),
+    ("installation_suspended", "The GitHub App installation is suspended on GitHub. Unsuspend it there."),
+    ("installation_link_inactive", "That GitHub installation is no longer linked to this workspace. Link it again in workspace settings."),
+    ("github_rate_limited", "GitHub is rate-limiting requests. Wait a moment and retry."),
+    ("github_unavailable", "GitHub didn't respond. Retry shortly."),
+    ("dockerfile_requires_github_app", "Dockerfile builds need a service connected to the GitHub App."),
+    ("dockerfile_builds_disabled", "Dockerfile builds aren't available."),
+    ("previews_disabled", "Preview environments aren't available in this workspace."),
+    ("preview_requires_github_app", "Previews need a service connected to the GitHub App."),
+    ("previews_unsupported_for_dockerfile", "Dockerfile services don't get previews."),
+    ("previews_unsupported_deploy_type", "Previews are available for webservice and static services only."),
+    ("preview_service_managed", "This is a pull-request preview. It's managed by its parent service and the pull request: change the parent instead."),
+    ("preview_forks_unsupported", "Previews for pull requests from forks aren't supported."),
+    ("preview_fork_unpinned", "This fork preview has no approved commit."),
+    ("github_state_invalid", "The GitHub authorization expired. Start again from the dashboard."),
+];
+
+/// The hint for an allowlisted API error code, or `None` for any other value.
+pub fn api_code_hint(code: &str) -> Option<&'static str> {
+    API_ERROR_HINTS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, h)| *h)
 }
 
 /// Static per-code table of `(likely_causes, suggested_commands)`. Returns empty
@@ -173,6 +222,26 @@ fn lookup_metadata(code: &str) -> (Vec<String>, Vec<String>) {
             )],
         ),
         "missing_dependency" => (vec![], vec!["partiri llm next".into()]),
+        "github_identity_required" => (
+            vec!["The API key's owner has not connected GitHub, or the authorization expired".into()],
+            vec!["partiri github setup".into(), "partiri github status".into()],
+        ),
+        "github_repo_not_accessible" | "github_installation_forbidden" => (
+            vec!["The GitHub App is not installed on the repository's account, or has no access to the repository".into()],
+            vec!["partiri github status".into(), "partiri github repos".into()],
+        ),
+        "installation_link_inactive" | "github_app_disabled" => (
+            vec![],
+            vec!["partiri github status".into()],
+        ),
+        "github_registry_switch_forbidden" | "dockerfile_requires_github_app" => (
+            vec!["The service deploys through the GitHub App".into()],
+            vec!["partiri service github disconnect".into()],
+        ),
+        "preview_requires_github_app" => (
+            vec!["The service is not connected to the GitHub App".into()],
+            vec!["partiri service github connect".into()],
+        ),
         _ => (vec![], vec![]),
     }
 }
