@@ -17,6 +17,7 @@ use crate::config::{
     PartiriConfig, DEPLOY_TYPES, DISK_SIZE_MAX, DISK_SIZE_MIN, MAX_NAME_LEN, RUNTIMES,
 };
 use crate::error::{CliError, Result};
+use crate::modules::github::GithubMe;
 use crate::output::{ctx, print_result};
 
 /// The agent guide (`LLM.md`), embedded at compile time and printed by
@@ -82,6 +83,10 @@ pub(crate) fn config_schema() -> Value {
                 "Environment variables are managed via 'partiri service env --path <.env>'; they are never stored in .partiri.jsonc.",
                 "service.disk requires a single-region service. Adding a second replica/region while a disk is attached returns a storage_replica_conflict error.",
                 "The disk block is declarative config only. 'service create' and 'service push' never provision or change the volume — run 'partiri storage create' to provision it and 'partiri storage update' to resize (grow only) or remount it.",
+                "service.github_app: true deploys through the Partiri GitHub App: repository_url must be a GitHub repo (https://github.com/<owner>/<repo>) with repository_branch set; registry_url and service_secret must be absent; deploy_type is not database/registry. It is a local marker, never sent to the API.",
+                "service.auto_deploy: deploy on every push to repository_branch. Only written by the GitHub App paths; the API turns it on when a GitHub App service is created without it.",
+                "runtime 'dockerfile' is valid only with github_app: true (Dockerfile builds are never offered by 'init' or 'llm template').",
+                "A GitHub App service's source is fixed: change it only with 'partiri service github connect|disconnect'; 'service push' refuses a changed repository, a service_secret or a registry_url on it.",
                 "PVCs can grow but never shrink. 'storage update' rejects a size decrease; to start smaller, detach+delete the volume (destroys data) and 'storage create' a new one.",
             ]),
         );
@@ -134,6 +139,15 @@ fn inject_service_constraints(schema: &mut Value) {
     }
     if let Some(active) = svc_props.get_mut("active") {
         active["default"] = json!(true);
+    }
+
+    // `github_app` is `skip_serializing` (it must never reach an API body), which
+    // schemars reports as `writeOnly`; it IS in `.partiri.jsonc`, so strip it.
+    if let Some(obj) = svc_props
+        .get_mut("github_app")
+        .and_then(|g| g.as_object_mut())
+    {
+        obj.remove("writeOnly");
     }
 
     // `disk` is inlined as a flat object (`Option<DiskConfig>` + inline_subschemas),
@@ -191,6 +205,7 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // Registry-sourced deploys don't run a build (image is already built) and the
     // run command is supplied by the image entrypoint, so suppress both.
     let is_registry = source == "registry";
+    let is_github = source == "github";
 
     let build_line = if is_registry {
         "    // \"build_command\": null,       // not used for registry-sourced deploys (image is pre-built)".to_string()
@@ -211,6 +226,14 @@ fn build_template(deploy_type: &str, runtime: &str, source: &str) -> String {
     // "repository_branch": null,
     // For private images, set fk_service_secret to a registry-secret UUID:
     // "service_secret": "uuid",  // run 'partiri service token --secret <UUID>'"#
+    } else if is_github {
+        r#"    // Deploys through the Partiri GitHub App: no access token, deploys on every push.
+    // Link GitHub and install the App first ('partiri github setup'); the repository
+    // must be visible to the App ('partiri github repos').
+    "repository_url": "https://github.com/your-org/your-repo",
+    "repository_branch": "main",
+    "github_app": true,
+    "auto_deploy": true,"#
     } else {
         r#"    "repository_url": "https://github.com/your-org/your-repo.git",
     "repository_branch": "main",
@@ -321,6 +344,22 @@ pub fn run_examples() -> Result<()> {
                 "partiri -j validate --remote",
                 "partiri -j -y service create",
                 "partiri -j -y service deploy",
+            ]
+        },
+        {
+            "name": "github-app-webservice",
+            "description": "Node.js webservice deployed through the Partiri GitHub App: no access token, deploys on every push.",
+            "jsonc": build_template("webservice", "node", "github"),
+            "commands": [
+                "partiri github setup   # connect GitHub and install the App (once per workspace)",
+                "partiri -j github status --workspace <WORKSPACE_UUID>",
+                "partiri -j github repos --workspace <WORKSPACE_UUID>",
+                "# edit .partiri.jsonc with the values above and real UUIDs from `partiri -j llm context`",
+                "partiri -j validate --remote",
+                "partiri -j -y service create",
+                "partiri -j -y service deploy   # later pushes to the branch deploy on their own",
+                "# Move an existing token-based service onto the App:",
+                "partiri -j -y service github connect",
             ]
         },
         {
@@ -582,17 +621,49 @@ pub fn run_errors() -> Result<()> {
         { "code": "config", "meaning": "Bad .partiri.jsonc content",
           "hint": "Re-check the file against the schema.", "likely_causes": [],
           "suggested_commands": ["partiri validate"] },
+        { "code": "api_code", "meaning": "GitHub integration errors carry an `api_code` field next to `code` (the HTTP status). The codes and hints are listed below under the same key.",
+          "hint": null, "likely_causes": [], "suggested_commands": ["partiri github status"] },
+        { "code": "github", "meaning": "A GitHub integration check the CLI itself ran (repository resolution, identity, installations) failed before or without an API call. It always carries an `api_code` (e.g. `github_repo_not_accessible`); the HTTP status field is not used.",
+          "hint": "Read `api_code` and its hint below.", "likely_causes": [],
+          "suggested_commands": ["partiri github status"] },
         { "code": "cancelled", "meaning": "User aborted (Ctrl-C / inquire cancel) — exit code 2",
           "hint": null, "likely_causes": [], "suggested_commands": [] },
         { "code": "missing_dependency", "meaning": "A required predecessor wasn't done",
           "hint": null, "likely_causes": [], "suggested_commands": ["partiri llm next"] }
     ]);
+    let mut catalog = catalog;
+    if let Some(list) = catalog.as_array_mut() {
+        list.extend(crate::error::API_ERROR_HINTS.iter().map(|(code, hint)| {
+            json!({
+                "code": code,
+                "meaning": "API error code (the `api_code` field of the error; `code` stays the HTTP status)",
+                "hint": hint,
+                "likely_causes": [],
+                "suggested_commands": github_error_commands(code),
+            })
+        }));
+    }
     if ctx().json {
         print_result(&catalog);
     } else {
         println!("{}", serde_json::to_string_pretty(&catalog).unwrap());
     }
     Ok(())
+}
+
+/// Suggested commands for an API error code in the `llm errors` catalog.
+fn github_error_commands(code: &str) -> Vec<&'static str> {
+    match code {
+        "github_identity_required" => vec!["partiri github setup", "partiri github status"],
+        "github_repo_not_accessible" | "github_installation_forbidden" => {
+            vec!["partiri github status", "partiri github repos"]
+        }
+        "github_registry_switch_forbidden" | "dockerfile_requires_github_app" => {
+            vec!["partiri service github disconnect"]
+        }
+        "preview_requires_github_app" => vec!["partiri service github connect"],
+        _ => vec!["partiri github status"],
+    }
 }
 
 // ─── explain ────────────────────────────────────────────────────────────────
@@ -677,6 +748,7 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
             "Your service MUST listen on the port given by the $PORT environment variable. Hard-coding a port causes health-check failures.",
         ],
         "service push" => vec![
+            "On a GitHub App service the source is fixed: push refuses a changed repository_url, a service_secret, a registry_url, and a github_app marker on a service that isn't connected. A branch change goes through (the API checks it). Change the source with 'service github connect|disconnect'.",
             "Updates only the service row; it never provisions, resizes, detaches, or deletes a volume.",
             "If the local disk block diverges from the live volume, push prints a hint (run 'partiri storage create' or 'partiri storage update') but applies nothing to storage.",
         ],
@@ -703,7 +775,30 @@ fn pitfalls_for(command: &str) -> Vec<&'static str> {
             "--workspace requires --project (projects don't carry across workspaces).",
             "--region requires --pod.",
         ],
+        "service github connect" => vec![
+            "Moves the service onto the GitHub App: it is redeployed right away and every push to the branch deploys it. Requires confirmation: pass -y in scripts.",
+            "The old deploy webhook stops working; remove it from the repository on GitHub (the command prints the URL). Rolling back to a deploy from before the switch still needs the old token.",
+            "Defaults to the live repository_url and branch; --repo changes the repository (and then defaults to its default branch).",
+            "Updates .partiri.jsonc: github_app, the canonical URL, the branch, auto_deploy; service_secret is removed.",
+            "Needs the API key's owner to have connected GitHub in the dashboard ('partiri github setup').",
+        ],
+        "service github disconnect" => vec![
+            "Pushes no longer deploy the service and it is cloned without credentials, so a private repository stops deploying. Requires confirmation: pass -y in scripts.",
+            "Non-interactively it does not set a token: run 'partiri service token --secret <id>' then 'partiri service push' for a private repository.",
+        ],
+        "service previews enable" => vec![
+            "Each open pull request gets its own preview service: a pod-month is charged when each preview is created and unused time is refunded when it is removed. Requires confirmation: pass -y in scripts.",
+            "--share-secrets gives the service's environment variables, secrets included, to the code of every pull request from a branch of the repository.",
+            "Only for GitHub App webservice and static services; run 'service previews' first to see availability, the limit and the live previews.",
+        ],
+        "service previews disable" => vec![
+            "Removes every preview environment of the service. Requires confirmation: pass -y in scripts.",
+        ],
+        "github setup" => vec![
+            "Opens the dashboard so the API key's owner can connect GitHub and install the App. Non-interactively it only prints the URL and the status.",
+        ],
         "service token" => vec![
+            "Refused on a GitHub App service: it uses no access token.",
             "Lists registry secrets when registry_url is set, otherwise repository secrets.",
         ],
         "db" => vec![
@@ -949,6 +1044,7 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
     };
 
     let mut ws_payload: Vec<Value> = Vec::new();
+    let mut me_cache: Option<Option<GithubMe>> = None;
     for w in &scoped {
         // Each per-workspace fan-out is sequential here for simplicity; the API caches per-workspace
         // for 5 minutes, so subsequent calls are cheap.
@@ -989,7 +1085,9 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
             }
         }
 
-        ws_payload.push(json!({
+        let github = github_context(client, &w.id, &mut me_cache);
+
+        let mut ws_entry = json!({
             "id": w.id,
             "name": w.name,
             "email": w.email,
@@ -1030,12 +1128,51 @@ pub(crate) fn build_context(client: &ApiClient, workspace: Option<String>) -> Re
                 "provider": s.provider,
             })).collect::<Vec<_>>(),
             "services": services_per_project,
-        }));
+        });
+        if let Some(g) = github {
+            ws_entry["github"] = g;
+        }
+        ws_payload.push(ws_entry);
     }
 
     Ok(json!({
         "user": { "email": user_email },
         "workspaces": ws_payload,
+    }))
+}
+
+/// Best-effort GitHub block of the `llm context` payload: present only when the
+/// GitHub App is available in the workspace; every error is swallowed.
+///
+/// `/integrations/github/me` is per user, not per workspace, so it is fetched at
+/// most once per `llm context` run and kept in `me_cache`.
+fn github_context(
+    client: &ApiClient,
+    workspace: &str,
+    me_cache: &mut Option<Option<GithubMe>>,
+) -> Option<Value> {
+    let cfg = client.github_config(workspace).ok().filter(|c| c.enabled)?;
+    let me = me_cache
+        .get_or_insert_with(|| client.github_me().ok())
+        .clone();
+    let state = match &me {
+        Some(m) if m.connected && m.reauth_required == Some(true) => "reauth_required",
+        Some(m) if m.connected => "connected",
+        Some(_) => "not_connected",
+        None => "unknown",
+    };
+    let installations = client.github_installations(workspace).unwrap_or_default();
+    Some(json!({
+        "available": true,
+        "previews_enabled": cfg.previews_enabled,
+        "state": state,
+        "login": me.and_then(|m| m.github_login),
+        "installations": installations.iter().map(|i| json!({
+            "account": i.account_login,
+            "type": i.account_type,
+            "repository_selection": i.repository_selection,
+            "suspended": i.suspended,
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -1121,7 +1258,11 @@ fn deduce_state(cfg: &PartiriConfig) -> (String, String, String) {
                 "partiri -j validate --remote{s} && partiri -j -y service create{s}",
                 s = crate::config::config_flag_suffix()
             ),
-            "Config looks ready. Validate against the API, then register the service.".into(),
+            if cfg.service.is_github_app() {
+                "Config looks ready. 'validate --remote' checks GitHub access and the branch, then 'service create' registers the service (and stops, never falling back to a token, if those fail).".into()
+            } else {
+                "Config looks ready. Validate against the API, then register the service.".into()
+            },
         );
     }
     // id is set — the deploy job history is the only source for what happened next,
@@ -1232,6 +1373,8 @@ mod tests {
             "repository_branch",
             "registry_url",
             "service_secret",
+            "github_app",
+            "auto_deploy",
             "build_path",
             "build_command",
             "pre_deploy_command",
@@ -1259,6 +1402,59 @@ mod tests {
         assert_eq!(
             actual, expected,
             "service.properties must match ServiceConfig serde field names (env excluded)"
+        );
+    }
+
+    #[test]
+    fn schema_documents_github_app_without_write_only() {
+        let schema = config_schema();
+        let app = schema
+            .pointer("/properties/service/properties/github_app")
+            .expect("github_app must be in the schema");
+        assert!(app.get("writeOnly").is_none(), "{app}");
+        assert!(app["description"].as_str().unwrap().contains("GitHub App"));
+        let auto = schema
+            .pointer("/properties/service/properties/auto_deploy")
+            .expect("auto_deploy must be in the schema");
+        assert!(auto["description"].as_str().unwrap().contains("push"));
+    }
+
+    #[test]
+    fn template_for_github_source_sets_the_marker_and_no_token() {
+        let t = build_template("webservice", "node", "github");
+        assert!(t.contains("\"github_app\": true,"), "{t}");
+        assert!(t.contains("\"auto_deploy\": true,"), "{t}");
+        assert!(!t.contains("\"service_secret\""), "{t}");
+        assert!(!t.contains("dockerfile"), "{t}");
+        assert!(!build_template("webservice", "node", "repo").contains("github_app"));
+    }
+
+    #[test]
+    fn errors_catalog_lists_every_api_code() {
+        for (code, _) in crate::error::API_ERROR_HINTS {
+            assert!(!github_error_commands(code).is_empty(), "{code}");
+        }
+        assert!(crate::error::API_ERROR_HINTS.len() >= 20);
+    }
+
+    #[test]
+    fn next_gives_a_github_app_config_the_validate_then_create_shape() {
+        let cfg = PartiriConfig {
+            id: None,
+            workspace: "w".into(),
+            project: "p".into(),
+            service: crate::config::ServiceConfig {
+                region: "r".into(),
+                pod: "pd".into(),
+                github_app: Some(true),
+                ..Default::default()
+            },
+        };
+        let (state, cmd, _) = deduce_state(&cfg);
+        assert_eq!(state, "needs_create");
+        assert_eq!(
+            cmd,
+            "partiri -j validate --remote && partiri -j -y service create"
         );
     }
 
@@ -1372,5 +1568,28 @@ mod tests {
             Some(true),
             "active default should be published"
         );
+    }
+
+    #[test]
+    fn github_context_fetches_me_once_across_workspaces() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        crate::modules::github::test_support::mock_config(&server);
+        let me = server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/me");
+            then.status(200)
+                .json_body(json!({"connected": true, "github_login": "me"}));
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/integrations/github/installations");
+            then.status(200).json_body(json!([]));
+        });
+        let client = ApiClient::for_test(server.base_url());
+        let mut cache = None;
+        let first = github_context(&client, "ws-1", &mut cache).unwrap();
+        let second = github_context(&client, "ws-2", &mut cache).unwrap();
+        assert_eq!(first["login"], "me");
+        assert_eq!(second["state"], "connected");
+        me.assert_calls(1);
     }
 }

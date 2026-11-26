@@ -44,7 +44,27 @@ pub fn init_ctx(c: AppContext) {
 /// Borrow the process-wide [`AppContext`], falling back to all-`false` defaults
 /// if [`init_ctx`] was never called (e.g. in unit tests).
 pub fn ctx() -> &'static AppContext {
+    #[cfg(test)]
+    if let Some(c) = TEST_CTX.with(|t| t.get()) {
+        return c;
+    }
     CTX.get().unwrap_or(&DEFAULT_CTX)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CTX: std::cell::Cell<Option<&'static AppContext>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: override [`ctx`] for the current test thread.
+#[cfg(test)]
+pub(crate) fn set_test_ctx(json: bool, yes: bool, no_input: bool) {
+    let c: &'static AppContext = Box::leak(Box::new(AppContext {
+        json,
+        yes,
+        no_input,
+    }));
+    TEST_CTX.with(|t| t.set(Some(c)));
 }
 
 /// Build an `AppContext` from explicit flag values, layering in non-TTY auto-detection.
@@ -380,6 +400,32 @@ pub struct JobRow {
     /// Short deploy reference, or `—` when absent.
     #[tabled(rename = "Ref")]
     pub deploy_ref: String,
+    /// Job status (colorized in human mode).
+    #[tabled(rename = "Status")]
+    pub status: String,
+    /// Formatted creation timestamp.
+    #[tabled(rename = "Created")]
+    pub created_at: String,
+    /// What started the job, as the API reports it. JSON only; omitted when the
+    /// API sends none.
+    #[tabled(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+/// A row of `partiri service jobs` when pushes or previews triggered some job:
+/// the same columns plus the trigger.
+#[derive(Tabled, Serialize)]
+pub struct JobTriggerRow {
+    /// Job kind (`deploy`, `pause`, …).
+    #[tabled(rename = "Type")]
+    pub job_type: String,
+    /// Short deploy reference, or `—` when absent.
+    #[tabled(rename = "Ref")]
+    pub deploy_ref: String,
+    /// What started the job (`push`, `manual`, `preview`, …) or `—`.
+    #[tabled(rename = "Trigger")]
+    pub trigger: String,
     /// Job status (colorized in human mode).
     #[tabled(rename = "Status")]
     pub status: String,

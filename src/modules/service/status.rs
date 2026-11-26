@@ -3,7 +3,7 @@
 
 use owo_colors::OwoColorize;
 
-use crate::client::{ApiClient, PrometheusData, PrometheusResponse};
+use crate::client::{ApiClient, PrometheusData, PrometheusResponse, Service};
 use crate::config::PartiriConfig;
 use crate::error::Result;
 use crate::output::{colored_job_status, ctx, format_datetime, print_result, sparkline};
@@ -87,6 +87,77 @@ fn format_bytes(bytes: f64) -> String {
     }
 }
 
+/// What `service metrics` reports about a GitHub App service's source.
+#[derive(Debug, serde::Serialize)]
+struct GithubSourceInfo {
+    kind: &'static str,
+    repo: Option<String>,
+    branch: Option<String>,
+    auto_deploy: Option<bool>,
+    previews_enabled: bool,
+    disconnected: bool,
+    suspended: Option<bool>,
+}
+
+const DISCONNECTED_BANNER: &str = "This repository is no longer reachable through the GitHub App (the App was uninstalled or lost access to it). Pushes don't deploy, and redeploys fail until you reconnect it with 'partiri service github connect'.";
+const SUSPENDED_BANNER: &str = "The GitHub App installation for this repository is suspended on GitHub. Deploys can't clone the repository until it is unsuspended.";
+
+/// The source block for an App service; `None` for every other service, whose
+/// output stays exactly as it was. Suspension is best effort: one installations
+/// call, errors ignored.
+fn github_source_info(
+    client: &ApiClient,
+    svc: &Service,
+    workspace: &str,
+) -> Option<GithubSourceInfo> {
+    if !svc.is_github_app() {
+        return None;
+    }
+    let suspended = svc.fk_github_installation.as_deref().and_then(|inst| {
+        client
+            .github_installations(workspace)
+            .ok()?
+            .into_iter()
+            .find(|i| i.id == inst)
+            .map(|i| i.suspended)
+    });
+    Some(GithubSourceInfo {
+        kind: "github_app",
+        repo: svc.github_repo_full_name.clone(),
+        branch: svc.repository_branch.clone(),
+        auto_deploy: svc.auto_deploy,
+        previews_enabled: svc.previews_enabled == Some(true),
+        disconnected: svc.github_disconnected_at.is_some(),
+        suspended,
+    })
+}
+
+fn on_off(v: bool) -> &'static str {
+    if v {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// The human lines for an App service's source.
+fn source_lines(info: &GithubSourceInfo) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Source: GitHub App · {} @ {} · deploy on push: {}",
+        info.repo.as_deref().unwrap_or("?"),
+        info.branch.as_deref().unwrap_or("?"),
+        on_off(info.auto_deploy.unwrap_or(false)),
+    )];
+    lines.push(format!("Previews: {}", on_off(info.previews_enabled)));
+    if info.disconnected {
+        lines.push(format!("warn: {DISCONNECTED_BANNER}"));
+    }
+    if info.suspended == Some(true) {
+        lines.push(format!("warn: {SUSPENDED_BANNER}"));
+    }
+    lines
+}
+
 /// Entry point for `partiri service metrics`. Fetches the service, its CPU/RAM/
 /// network metrics, and its jobs; renders sparklines in human mode or raw metric
 /// points in JSON mode.
@@ -99,6 +170,7 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let mem_resp = client.read_metrics_memory(id, deploy_tag);
     let net_resp = client.read_metrics_network(id, deploy_tag);
     let jobs_resp = client.list_service_jobs(id);
+    let source = github_source_info(client, &service, &config.workspace);
 
     if ctx().json {
         // Emit raw points for an agent to chart however it wants. Sparklines and
@@ -135,15 +207,19 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
                 }));
             }
         }
+        let mut service_json = serde_json::json!({
+            "id": service.id,
+            "name": service.name,
+            "deploy_type": service.deploy_type,
+            "runtime": service.runtime,
+            "deploy_tag": service.deploy_tag,
+            "external_sd_url": service.external_sd_url,
+        });
+        if let Some(info) = &source {
+            service_json["source"] = serde_json::json!(info);
+        }
         print_result(&serde_json::json!({
-            "service": {
-                "id": service.id,
-                "name": service.name,
-                "deploy_type": service.deploy_type,
-                "runtime": service.runtime,
-                "deploy_tag": service.deploy_tag,
-                "external_sd_url": service.external_sd_url,
-            },
+            "service": service_json,
             "metrics": {
                 "cpu": cpu_points,
                 "memory": mem_points,
@@ -160,6 +236,16 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
         service.name.bold(),
         format!("({})", service.deploy_type).dimmed(),
     );
+
+    if let Some(info) = &source {
+        for line in source_lines(info) {
+            match line.strip_prefix("warn: ") {
+                Some(w) => println!("  {} {}", "warn:".yellow(), w),
+                None => println!("  {}", line),
+            }
+        }
+        println!();
+    }
 
     let span = cpu_resp
         .as_ref()
@@ -222,4 +308,44 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info() -> GithubSourceInfo {
+        GithubSourceInfo {
+            kind: "github_app",
+            repo: Some("acme/web".into()),
+            branch: Some("main".into()),
+            auto_deploy: Some(true),
+            previews_enabled: false,
+            disconnected: false,
+            suspended: None,
+        }
+    }
+
+    #[test]
+    fn source_lines_state_repo_branch_and_toggles() {
+        let lines = source_lines(&info());
+        assert_eq!(
+            lines[0],
+            "Source: GitHub App · acme/web @ main · deploy on push: on"
+        );
+        assert_eq!(lines[1], "Previews: off");
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn source_lines_warn_when_disconnected_or_suspended() {
+        let mut i = info();
+        i.disconnected = true;
+        i.suspended = Some(true);
+        let lines = source_lines(&i);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("partiri service github connect")));
+        assert!(lines.iter().any(|l| l.contains("is suspended on GitHub")));
+    }
 }

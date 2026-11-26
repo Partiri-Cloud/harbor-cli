@@ -27,9 +27,11 @@ fn refresh_existing(client: &ApiClient, existing: &PartiriConfig) -> Result<Part
         .as_deref()
         .ok_or("Service has no id yet; cannot refresh")?;
     let service = client.read_service(id)?;
+    reject_preview(&service)?;
 
     let mut refreshed = existing.clone();
     apply_live_pod(&mut refreshed, service.fk_pod.as_deref());
+    apply_live_github(&mut refreshed, &service);
     let fetched = fetch_service_disk(client, &refreshed.project, id);
     apply_live_disk(&mut refreshed, fetched);
     refreshed.save()?;
@@ -66,6 +68,39 @@ fn apply_live_pod(config: &mut PartiriConfig, live: Option<&str>) {
         );
     }
     config.service.pod = live.to_string();
+}
+
+/// Fold the live GitHub App state into an existing config: a live App service
+/// gets `github_app: true`, the live `auto_deploy`, and the live repository URL
+/// and branch (the API owns them for an App service: a local edit would be
+/// silently ignored by `push`). A service that is not an App service never gets
+/// these fields; a stale `github_app` marker (the service was disconnected
+/// elsewhere, e.g. in the dashboard) is removed with its `auto_deploy`, as a
+/// CLI disconnect would, so `push` and `token` work again.
+fn apply_live_github(config: &mut PartiriConfig, live: &Service) {
+    if !live.is_github_app() {
+        if config.service.is_github_app() {
+            config.service.github_app = None;
+            config.service.auto_deploy = None;
+            if !crate::output::ctx().json {
+                eprintln!(
+                    "  {} the service is no longer connected to the GitHub App; removed github_app from the config.",
+                    "note:".cyan(),
+                );
+            }
+        }
+        return;
+    }
+    config.service.github_app = Some(true);
+    if let Some(url) = non_empty(live.repository_url.clone()) {
+        config.service.repository_url = Some(url);
+    }
+    if let Some(branch) = non_empty(live.repository_branch.clone()) {
+        config.service.repository_branch = Some(branch);
+    }
+    if live.auto_deploy.is_some() {
+        config.service.auto_deploy = live.auto_deploy;
+    }
 }
 
 /// Fold the live volume's disk state into `config.service.disk` without ever
@@ -143,6 +178,7 @@ pub fn run_by_id(client: &ApiClient, service_id: &str) -> Result<()> {
 
     let service = client.read_service(service_id)?;
     reject_database(&service)?;
+    reject_preview(&service)?;
     let fk_workspace = service.fk_workspace.clone().unwrap_or_default();
     let fk_project = service.fk_project.clone().unwrap_or_default();
     let mut config = map_to_config(service, service_id.to_string(), fk_workspace, fk_project)?;
@@ -334,6 +370,7 @@ pub fn run(client: &ApiClient) -> Result<()> {
 
     // ── Step 4: fetch full service details ────────────────────────────────────
     let service = client.read_service(&id)?;
+    reject_preview(&service)?;
 
     // ── Step 5: map to config and write ──────────────────────────────────────
     // Capture the live-volume fetch before `id`/`project_id` are moved into
@@ -380,6 +417,29 @@ pub(crate) fn reject_database(svc: &Service) -> Result<()> {
     ))
 }
 
+/// Refuse to pull a pull-request preview: its parent service and the pull
+/// request manage it, so a config for it would only be overwritten.
+pub(crate) fn reject_preview(svc: &Service) -> Result<()> {
+    if !svc.is_preview() {
+        return Ok(());
+    }
+    let pr = svc
+        .preview_pr_number
+        .map(|n| format!(" #{n}"))
+        .unwrap_or_default();
+    Err(Box::new(
+        CliError::new(
+            "validation",
+            format!(
+                "{} is a preview of pull request{pr}. It's managed by its parent service and the pull request. Pull the parent instead.",
+                svc.name
+            ),
+        )
+        .with_api_code("preview_service_managed")
+        .enriched(),
+    ))
+}
+
 /// Treat an empty string from the API as an absent value. The DB stores `''`
 /// (not NULL) in unused optional columns, so a registry-sourced service comes
 /// back with `repository_url: Some("")` — which `to_jsonc_string` would read
@@ -407,6 +467,7 @@ pub(crate) fn map_to_config(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or("Pulled service is missing a primary region replica")?;
+    let is_app = svc.is_github_app();
     Ok(PartiriConfig {
         id: Some(id),
         workspace: svc.fk_workspace.unwrap_or(fk_workspace),
@@ -420,6 +481,10 @@ pub(crate) fn map_to_config(
             repository_branch: non_empty(svc.repository_branch),
             registry_url: non_empty(svc.registry_url),
             service_secret: non_empty(svc.fk_service_secret),
+            // Written only for a live App service; a service that never used the
+            // App pulls back exactly as before.
+            github_app: is_app.then_some(true),
+            auto_deploy: if is_app { svc.auto_deploy } else { None },
             build_path: non_empty(svc.build_path),
             build_command: non_empty(svc.build_command),
             pre_deploy_command: non_empty(svc.pre_deploy_command),
@@ -737,7 +802,140 @@ mod tests {
             env: None,
             created_at: None,
             updated_at: None,
+            fk_github_installation: None,
+            github_repo_id: None,
+            github_repo_full_name: None,
+            github_disconnected_at: None,
+            auto_deploy: None,
+            fk_parent_service: None,
+            preview_pr_number: None,
+            previews_enabled: None,
         }
+    }
+
+    fn pull(svc: Service) -> PartiriConfig {
+        map_to_config(svc, "svc-123".into(), "ws-1".into(), "proj-1".into()).unwrap()
+    }
+
+    #[test]
+    fn pulling_a_non_app_service_writes_neither_github_field() {
+        let cfg = pull(make_service());
+        assert!(cfg.service.github_app.is_none());
+        assert!(cfg.service.auto_deploy.is_none());
+        let text = cfg.to_jsonc_string().unwrap();
+        assert!(
+            !text.contains("\"github_app\"") && !text.contains("\"auto_deploy\""),
+            "{text}"
+        );
+        // Even if the API reports auto_deploy for a service without the App.
+        let mut svc = make_service();
+        svc.auto_deploy = Some(true);
+        assert!(pull(svc).service.auto_deploy.is_none());
+    }
+
+    #[test]
+    fn pulling_an_app_service_writes_the_marker_and_live_auto_deploy() {
+        let mut svc = make_service();
+        svc.github_repo_id = Some(42);
+        svc.auto_deploy = Some(false);
+        let cfg = pull(svc);
+        assert_eq!(cfg.service.github_app, Some(true));
+        assert_eq!(cfg.service.auto_deploy, Some(false));
+        let text = cfg.to_jsonc_string().unwrap();
+        assert!(text.contains("\"github_app\": true,"), "{text}");
+        assert!(text.contains("\"auto_deploy\": false,"), "{text}");
+        let again = PartiriConfig::parse_str(&text).unwrap();
+        assert_eq!(again.service.github_app, Some(true));
+        assert_eq!(again.service.auto_deploy, Some(false));
+    }
+
+    #[test]
+    fn a_dockerfile_app_service_round_trips_pull_validate() {
+        let mut svc = make_service();
+        svc.github_repo_id = Some(42);
+        svc.runtime = "dockerfile".into();
+        svc.build_command = None;
+        let cfg = pull(svc);
+        assert_eq!(cfg.service.runtime, "dockerfile");
+        let text = cfg.to_jsonc_string().unwrap();
+        let parsed = PartiriConfig::parse_str(&text).unwrap();
+        let failed: Vec<_> = crate::config::validate_config(&parsed)
+            .into_iter()
+            .filter(|r| !r.ok)
+            .collect();
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    fn apply_live_github_only_touches_app_services() {
+        let mut cfg = pull(make_service());
+        apply_live_github(&mut cfg, &make_service());
+        assert!(cfg.service.github_app.is_none());
+        let mut live = make_service();
+        live.github_repo_id = Some(1);
+        live.auto_deploy = Some(true);
+        apply_live_github(&mut cfg, &live);
+        assert_eq!(cfg.service.github_app, Some(true));
+        assert_eq!(cfg.service.auto_deploy, Some(true));
+    }
+
+    #[test]
+    fn refresh_removes_a_stale_github_app_marker() {
+        let mut cfg = pull(make_service());
+        cfg.service.github_app = Some(true);
+        cfg.service.auto_deploy = Some(false);
+        cfg.service.repository_url = Some("https://github.com/acme/web".into());
+        apply_live_github(&mut cfg, &make_service());
+        assert!(cfg.service.github_app.is_none());
+        assert!(cfg.service.auto_deploy.is_none());
+        assert_eq!(
+            cfg.service.repository_url.as_deref(),
+            Some("https://github.com/acme/web")
+        );
+    }
+
+    #[test]
+    fn refresh_of_an_app_service_takes_live_repository_url_and_branch() {
+        let mut cfg = pull(make_service());
+        cfg.service.repository_url = Some("https://github.com/old/name".into());
+        cfg.service.repository_branch = Some("old".into());
+        let mut live = make_service();
+        live.github_repo_id = Some(1);
+        live.repository_url = Some("https://github.com/Acme/Web".into());
+        live.repository_branch = Some("release".into());
+        apply_live_github(&mut cfg, &live);
+        assert_eq!(
+            cfg.service.repository_url.as_deref(),
+            Some("https://github.com/Acme/Web")
+        );
+        assert_eq!(cfg.service.repository_branch.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn refresh_of_a_non_app_service_keeps_local_repository_fields() {
+        let mut cfg = pull(make_service());
+        cfg.service.repository_url = Some("https://github.com/local/edit".into());
+        cfg.service.repository_branch = Some("local".into());
+        let mut live = make_service();
+        live.repository_url = Some("https://github.com/live/other".into());
+        live.repository_branch = Some("live".into());
+        apply_live_github(&mut cfg, &live);
+        assert_eq!(
+            cfg.service.repository_url.as_deref(),
+            Some("https://github.com/local/edit")
+        );
+        assert_eq!(cfg.service.repository_branch.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn reject_preview_names_the_pull_request() {
+        let mut svc = make_service();
+        svc.fk_parent_service = Some("parent".into());
+        svc.preview_pr_number = Some(17);
+        let err = reject_preview(&svc).unwrap_err().to_string();
+        assert!(err.contains("preview of pull request #17"), "{err}");
+        assert!(err.contains("Pull the parent instead"), "{err}");
+        assert!(reject_preview(&make_service()).is_ok());
     }
 
     #[test]

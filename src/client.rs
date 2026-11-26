@@ -159,9 +159,62 @@ pub struct Service {
     pub created_at: Option<String>,
     #[allow(dead_code)]
     pub updated_at: Option<String>,
+
+    // ── GitHub App source and previews (server-managed) ──────────────────
+    /// `github_installations.id` of the App installation the service clones through.
+    #[serde(default)]
+    pub fk_github_installation: Option<String>,
+    /// GitHub's numeric repo id. Set exactly when the service is an App service.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub github_repo_id: Option<i64>,
+    /// Canonical `owner/repo` of the App source.
+    #[serde(default)]
+    pub github_repo_full_name: Option<String>,
+    /// Set when the App lost access (uninstalled, or the repo was removed).
+    #[serde(default)]
+    pub github_disconnected_at: Option<String>,
+    /// Deploy on every push to the branch.
+    #[serde(default)]
+    pub auto_deploy: Option<bool>,
+    /// Set on a pull-request preview: the service it belongs to.
+    #[serde(default)]
+    pub fk_parent_service: Option<String>,
+    /// Pull request number of a preview.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub preview_pr_number: Option<i64>,
+    /// PR previews are enabled on this service.
+    #[serde(default)]
+    pub previews_enabled: Option<bool>,
+}
+
+/// Deserialize an integer that may arrive as a JSON number or a numeric string
+/// (a `bigint` column), and read anything else as absent rather than failing
+/// the whole service.
+fn lenient_i64<'de, D>(d: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <Option<serde_json::Value> as serde::Deserialize>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
+    })
 }
 
 impl Service {
+    /// True for a service connected to the GitHub App.
+    pub fn is_github_app(&self) -> bool {
+        self.github_repo_id.is_some()
+    }
+
+    /// True for a pull-request preview child.
+    pub fn is_preview(&self) -> bool {
+        self.fk_parent_service
+            .as_deref()
+            .is_some_and(|p| !p.is_empty())
+    }
+
     /// The `fk_region` of the primary replica, if one is present.
     pub fn primary_region(&self) -> Option<&str> {
         self.replicas
@@ -239,6 +292,10 @@ pub struct Job {
     /// Last-update timestamp.
     #[allow(dead_code)]
     pub updated_at: Option<String>,
+    /// What started the job: `manual`, `deploy_hook`, `github_push`, `rollback`,
+    /// `preview`; `None` on old rows.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 /// A paginated list of [`Job`]s.
@@ -458,6 +515,9 @@ struct ServiceBody<'a> {
     service: &'a ServiceConfig,
     fk_project: &'a str,
     fk_workspace: &'a str,
+    /// Creates an App service; the server fills the repository columns from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github: Option<&'a crate::modules::github::GithubSourceBody>,
 }
 
 /// One entry of the `replicas` array on a service-create body. A managed
@@ -632,7 +692,7 @@ impl ApiClient {
         unreachable!()
     }
 
-    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub(crate) fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let spinner = new_spinner();
         let response = self.send_with_retry(|| {
             self.agent
@@ -645,7 +705,11 @@ impl ApiClient {
         self.handle_response(response)
     }
 
-    fn get_query<T: DeserializeOwned>(&self, path: &str, params: &[(&str, &str)]) -> Result<T> {
+    pub(crate) fn get_query<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<T> {
         let spinner = new_spinner();
         let response = self.send_with_retry(|| {
             let mut req = self
@@ -661,7 +725,11 @@ impl ApiClient {
         self.handle_response(response)
     }
 
-    fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+    pub(crate) fn post<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         let spinner = new_spinner();
         let response = self.send_with_retry(|| {
             self.agent
@@ -700,6 +768,34 @@ impl ApiClient {
         self.handle_response_empty(response)
     }
 
+    /// `PUT path` with a JSON body, parsing the response body.
+    pub(crate) fn put<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
+        let spinner = new_spinner();
+        let response = self.send_with_retry(|| {
+            self.agent
+                .put(&format!("{}{}", self.base_url, path))
+                .set("x-api-key", &self.api_key)
+                .send_json(body)
+                .map_err(Box::new)
+        })?;
+        spinner.finish_and_clear();
+        self.handle_response(response)
+    }
+
+    /// `DELETE path`, parsing the response body.
+    pub(crate) fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let spinner = new_spinner();
+        let response = self.send_with_retry(|| {
+            self.agent
+                .delete(&format!("{}{}", self.base_url, path))
+                .set("x-api-key", &self.api_key)
+                .call()
+                .map_err(Box::new)
+        })?;
+        spinner.finish_and_clear();
+        self.handle_response(response)
+    }
+
     fn patch<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
         let spinner = new_spinner();
         let response = self.send_with_retry(|| {
@@ -716,10 +812,18 @@ impl ApiClient {
     fn error_message(response: Response) -> crate::error::Error {
         let status = response.status();
         let body = response.into_string().unwrap_or_default();
-        let msg = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
+        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let msg = parsed
+            .as_ref()
             .and_then(|v| v["message"].as_str().map(String::from))
             .unwrap_or_else(|| "An unexpected error occurred.".to_string());
+        // Only allowlisted codes count: every other Nest error puts the HTTP
+        // reason phrase ("Forbidden") in `error`, which is not a code.
+        let api_code = parsed
+            .as_ref()
+            .and_then(|v| v["error"].as_str())
+            .filter(|c| crate::error::api_code_hint(c).is_some())
+            .map(String::from);
 
         let hint = match status {
             400 => Some("Check that your configuration values are valid."),
@@ -735,8 +839,18 @@ impl ApiClient {
         };
 
         let mut err = crate::error::CliError::new(status.to_string(), msg);
-        if let Some(h) = hint {
-            err = err.with_hint(h);
+        match api_code {
+            Some(code) => {
+                if let Some(h) = crate::error::api_code_hint(&code) {
+                    err = err.with_hint(h);
+                }
+                err = err.with_api_code(code);
+            }
+            None => {
+                if let Some(h) = hint {
+                    err = err.with_hint(h);
+                }
+            }
         }
         Box::new(err.enriched())
     }
@@ -869,17 +983,21 @@ impl ApiClient {
     }
 
     /// Register a new service (`POST /services`) and return the created record,
-    /// including its assigned `id` and `external_sd_url`.
+    /// including its assigned `id` and `external_sd_url`. With `github`, creates
+    /// a GitHub App service (the `github` block of the body); the server then
+    /// fills the repository columns and `auto_deploy`.
     pub fn create_service(
         &self,
         service: &ServiceConfig,
         project_id: &str,
         workspace_id: &str,
+        github: Option<&crate::modules::github::GithubSourceBody>,
     ) -> Result<Service> {
         let body = ServiceBody {
             service,
             fk_project: project_id,
             fk_workspace: workspace_id,
+            github,
         };
         self.post("/services", &body)
     }
@@ -939,6 +1057,12 @@ impl ApiClient {
     /// Push an updated [`ServiceConfig`] to an existing service (`PUT /services/{id}`).
     pub fn update_service(&self, id: &str, service: &ServiceConfig) -> Result<()> {
         self.put_empty(&format!("/services/{}", id), service)
+    }
+
+    /// `PUT /services/{id}` with only the given fields. The API takes partial
+    /// updates, so nothing else the local config holds is applied.
+    pub fn update_service_fields(&self, id: &str, fields: &serde_json::Value) -> Result<()> {
+        self.put_empty(&format!("/services/{}", id), fields)
     }
 
     /// List the jobs for a service, newest page first (`GET /jobs/services/{id}`).
@@ -2084,6 +2208,7 @@ mod tests {
             service: &service,
             fk_project: "proj-1",
             fk_workspace: "ws-1",
+            github: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(
@@ -2285,5 +2410,189 @@ mod tests {
         if has_key {
             assert!(ApiClient::new().is_ok(), "should succeed with key file");
         }
+    }
+
+    // ─── GitHub App: error codes, body, fields ───────────────────────────────
+
+    #[test]
+    fn allowlisted_api_code_is_kept_beside_the_http_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/workspaces");
+            then.status(403).json_body(json!({
+                "statusCode": 403, "error": "github_identity_required", "message": "No GitHub identity"
+            }));
+        });
+        let err = test_client(&server).list_workspaces().unwrap_err();
+        let cli = err.downcast_ref::<crate::error::CliError>().unwrap();
+        assert_eq!(cli.code, "403");
+        assert_eq!(cli.api_code.as_deref(), Some("github_identity_required"));
+        let text = err.to_string();
+        assert!(
+            text.contains("API error 403 — No GitHub identity"),
+            "{text}"
+        );
+        assert!(text.contains("Connect your GitHub account first"), "{text}");
+        assert!(
+            !text.contains("lack permission"),
+            "generic 403 hint must be replaced: {text}"
+        );
+        assert!(cli
+            .suggested_commands
+            .contains(&"partiri github setup".to_string()));
+        let json = serde_json::to_value(cli).unwrap();
+        assert_eq!(json["api_code"], "github_identity_required");
+        assert_eq!(json["code"], "403");
+    }
+
+    #[test]
+    fn a_coded_error_never_takes_the_generic_status_causes() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/workspaces");
+            then.status(409).json_body(json!({
+                "statusCode": 409, "error": "preview_service_managed", "message": "managed"
+            }));
+        });
+        let err = test_client(&server).list_workspaces().unwrap_err();
+        let cli = err.downcast_ref::<crate::error::CliError>().unwrap();
+        assert_eq!(cli.api_code.as_deref(), Some("preview_service_managed"));
+        assert!(cli.likely_causes.is_empty(), "{:?}", cli.likely_causes);
+        assert!(
+            cli.suggested_commands.is_empty(),
+            "{:?}",
+            cli.suggested_commands
+        );
+    }
+
+    #[test]
+    fn http_reason_phrases_are_not_read_as_api_codes() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/workspaces");
+            then.status(403)
+                .json_body(json!({"statusCode": 403, "error": "Forbidden", "message": "nope"}));
+        });
+        let err = test_client(&server).list_workspaces().unwrap_err();
+        let cli = err.downcast_ref::<crate::error::CliError>().unwrap();
+        assert!(cli.api_code.is_none());
+        assert!(err.to_string().contains("lack permission"), "{err}");
+        assert!(serde_json::to_value(cli).unwrap().get("api_code").is_none());
+    }
+
+    #[test]
+    fn every_api_code_maps_to_its_hint() {
+        for (code, hint) in crate::error::API_ERROR_HINTS {
+            let server = MockServer::start();
+            server.mock(|when, then| {
+                when.method(GET).path("/workspaces");
+                then.status(400)
+                    .json_body(json!({"statusCode": 400, "error": code, "message": "m"}));
+            });
+            let err = test_client(&server).list_workspaces().unwrap_err();
+            let cli = err.downcast_ref::<crate::error::CliError>().unwrap();
+            assert_eq!(cli.api_code.as_deref(), Some(*code));
+            assert_eq!(cli.hint.as_deref(), Some(*hint));
+        }
+    }
+
+    #[test]
+    fn service_body_carries_github_block_but_never_the_marker() {
+        let service = ServiceConfig {
+            name: "svc".into(),
+            github_app: Some(true),
+            auto_deploy: Some(true),
+            ..Default::default()
+        };
+        let source = crate::modules::github::GithubSourceBody {
+            installation_link_id: "link-1".into(),
+            repo_id: 42,
+            branch: "main".into(),
+        };
+        let body = ServiceBody {
+            service: &service,
+            fk_project: "p",
+            fk_workspace: "w",
+            github: Some(&source),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("github_app").is_none(), "{v}");
+        assert_eq!(v["auto_deploy"], true);
+        assert_eq!(v["github"]["repo_id"], 42);
+        assert_eq!(v["github"]["installation_link_id"], "link-1");
+    }
+
+    #[test]
+    fn update_body_never_carries_the_marker() {
+        let server = MockServer::start();
+        let put = server.mock(|when, then| {
+            when.method(PUT)
+                .path("/services/svc-1")
+                .body_excludes("github_app")
+                .body_includes("\"auto_deploy\":false");
+            then.status(200).json_body(json!({}));
+        });
+        let service = ServiceConfig {
+            name: "svc".into(),
+            github_app: Some(true),
+            auto_deploy: Some(false),
+            ..Default::default()
+        };
+        test_client(&server)
+            .update_service("svc-1", &service)
+            .unwrap();
+        put.assert_calls(1);
+    }
+
+    #[test]
+    fn plain_service_bodies_have_no_github_keys() {
+        let service = ServiceConfig {
+            name: "svc".into(),
+            ..Default::default()
+        };
+        let body = ServiceBody {
+            service: &service,
+            fk_project: "p",
+            fk_workspace: "w",
+            github: None,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            !json.contains("github") && !json.contains("auto_deploy"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn service_reads_github_fields_leniently() {
+        let svc: Service = serde_json::from_value(json!({
+            "id": "s", "name": "n", "deploy_type": "webservice", "runtime": "node",
+            "github_repo_id": "123", "github_repo_full_name": "a/b", "auto_deploy": true,
+            "fk_parent_service": "p", "preview_pr_number": 9, "previews_enabled": true
+        }))
+        .unwrap();
+        assert!(svc.is_github_app() && svc.is_preview());
+        assert_eq!(svc.github_repo_id, Some(123));
+        assert_eq!(svc.preview_pr_number, Some(9));
+        let plain: Service = serde_json::from_value(json!({
+            "id": "s", "name": "n", "deploy_type": "webservice", "runtime": "node",
+            "github_repo_id": null, "fk_parent_service": null
+        }))
+        .unwrap();
+        assert!(!plain.is_github_app() && !plain.is_preview());
+    }
+
+    #[test]
+    fn job_trigger_is_optional() {
+        let with: Job = serde_json::from_value(json!({
+            "id": "j", "fk_service": "s", "type": "deploy", "status": "ok", "trigger": "github_push"
+        }))
+        .unwrap();
+        assert_eq!(with.trigger.as_deref(), Some("github_push"));
+        let old: Job = serde_json::from_value(json!({
+            "id": "j", "fk_service": "s", "type": "deploy", "status": "ok"
+        }))
+        .unwrap();
+        assert!(old.trigger.is_none());
     }
 }

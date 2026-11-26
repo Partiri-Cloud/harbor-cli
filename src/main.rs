@@ -38,9 +38,9 @@ mod modules;
 mod output;
 
 use cli::{
-    AuthCommands, Cli, Commands, DbCommands, LlmCommands, McpCommands, PodCommands,
-    ProjectCommands, RegionCommands, SecretsCommands, ServiceCommands, StorageCommands,
-    WorkspaceCommands,
+    AuthCommands, Cli, Commands, DbCommands, GithubCommands, LlmCommands, McpCommands, PodCommands,
+    PreviewsCommands, ProjectCommands, RegionCommands, SecretsCommands, ServiceCommands,
+    ServiceGithubCommands, StorageCommands, WorkspaceCommands,
 };
 use client::ApiClient;
 use config::PartiriConfig;
@@ -184,6 +184,42 @@ fn run(cli: Cli) -> error::Result<()> {
                 ServiceCommands::Env { path, save } => {
                     modules::service::env::run(&client, config, path, save)?
                 }
+                ServiceCommands::Github(ServiceGithubCommands::Connect { repo, branch }) => {
+                    modules::service::github::run_connect(
+                        &client,
+                        config,
+                        modules::service::github::ConnectArgs { repo, branch },
+                    )?
+                }
+                ServiceCommands::Github(ServiceGithubCommands::Disconnect) => {
+                    modules::service::github::run_disconnect(&client, config)?
+                }
+                ServiceCommands::Previews { cmd } => match cmd {
+                    None | Some(PreviewsCommands::Show) => {
+                        modules::service::previews::run_show(&client, &config)?
+                    }
+                    Some(PreviewsCommands::Enable {
+                        pod,
+                        share_secrets,
+                        no_share_secrets,
+                    }) => modules::service::previews::run_enable(
+                        &client,
+                        &config,
+                        modules::service::previews::EnableArgs {
+                            pod,
+                            share_secrets: if share_secrets {
+                                Some(true)
+                            } else if no_share_secrets {
+                                Some(false)
+                            } else {
+                                None
+                            },
+                        },
+                    )?,
+                    Some(PreviewsCommands::Disable) => {
+                        modules::service::previews::run_disable(&client, &config)?
+                    }
+                },
                 ServiceCommands::List { .. } | ServiceCommands::Pull { .. } => unreachable!(),
             }
         }
@@ -259,6 +295,23 @@ fn run(cli: Cli) -> error::Result<()> {
 
         Commands::Mcp(McpCommands::Uninstall { client }) => {
             modules::mcp::uninstall::run(client.as_deref())?;
+        }
+
+        Commands::Github(cmd) => {
+            let client = ApiClient::new()?;
+            match cmd {
+                GithubCommands::Status { workspace } => {
+                    modules::github::run_status(&client, workspace)?
+                }
+                GithubCommands::Setup { workspace } => {
+                    modules::github::run_setup(&client, workspace)?
+                }
+                GithubCommands::Repos {
+                    workspace,
+                    search,
+                    page,
+                } => modules::github::run_repos(&client, workspace, search, page)?,
+            }
         }
 
         Commands::Secrets(cmd) => {

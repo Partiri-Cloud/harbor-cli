@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **GitHub App support.** A service can deploy through the Partiri GitHub App: no
+  access token, and every push to the branch deploys it.
+  - `.partiri.jsonc` gains `service.github_app: true` (a local marker, never sent to
+    the API) and `service.auto_deploy`. Configs without them behave exactly as before.
+  - `partiri init` offers the GitHub App only when the repository is on GitHub and the
+    App is available in the workspace; otherwise the wizard is unchanged. `init
+    --template` adds one commented `github_app` line.
+  - `partiri github status | setup | repos` show the connection, open the dashboard to
+    connect GitHub and install the App, and list the repositories the App can see.
+  - `partiri service github connect | disconnect` move a service onto or off the App.
+    Each states its side effects and asks for confirmation (`-y` skips it).
+  - `partiri service previews [show | enable | disable]` manage pull-request preview
+    environments, with the cost stated before enabling.
+  - `service create` with `github_app: true` resolves the repository and branch and
+    never falls back to a token; `service pull` writes the marker for an App service;
+    `service push` refuses to change the source of an App service; `service token` is
+    refused on one; `validate --remote` checks the GitHub account, repository and branch.
+  - `service jobs` shows a Trigger column once a push or a preview has started a job,
+    and carries `trigger` in JSON; `service metrics` shows the App source, previews and
+    disconnected/suspended warnings.
+  - API errors from the GitHub integration carry an `api_code` field next to `code`
+    (the HTTP status), with a specific hint. `partiri llm errors` lists every code.
+  - `partiri llm` knows the new fields: schema, `template --source github`, an example,
+    pitfalls, a GitHub block in `llm context`, and `llm next`.
+  - `runtime: "dockerfile"` services round-trip through `pull`, `validate` and `push`
+    (valid only with `github_app: true`); it is never offered by `init`.
+
 ## [0.5.1] — 2026-09-17
 
 ### Changed

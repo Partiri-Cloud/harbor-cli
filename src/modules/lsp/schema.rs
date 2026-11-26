@@ -106,6 +106,13 @@ mod tests {
     }
 
     #[test]
+    fn github_app_keys_are_known_service_keys_with_docs() {
+        let idx = SchemaIndex::build();
+        assert!(idx.service["github_app"].description.contains("GitHub App"));
+        assert!(idx.service["auto_deploy"].description.contains("push"));
+    }
+
+    #[test]
     fn env_is_not_a_known_service_key() {
         let idx = SchemaIndex::build();
         assert!(!idx.service.contains_key("env"));
