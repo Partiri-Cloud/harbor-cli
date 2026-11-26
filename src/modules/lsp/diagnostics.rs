@@ -32,6 +32,17 @@ fn field_paths(field: &str) -> &'static [&'static [&'static str]] {
         "remote.workspace" | "remote.balance" => &[&["workspace"]],
         "remote.project" => &[&["project"]],
         "source" => &[&["service", "repository_url"], &["service", "registry_url"]],
+        "github_app.repository_url" | "remote.github_repo" => {
+            &[&["service", "repository_url"], &["service", "github_app"]]
+        }
+        "github_app.repository_branch" | "remote.github_branch" => &[
+            &["service", "repository_branch"],
+            &["service", "github_app"],
+        ],
+        "github_app.registry_url" => &[&["service", "registry_url"]],
+        "github_app.service_secret" => &[&["service", "service_secret"]],
+        "github_app.deploy_type" => &[&["service", "deploy_type"]],
+        "remote.github_identity" => &[&["service", "github_app"]],
         "deploy_type/static" | "remote.registry_url" => &[&["service", "registry_url"]],
         "remote.repository_url" => &[&["service", "repository_url"]],
         "remote.repository_branch" => &[&["service", "repository_branch"]],
@@ -248,6 +259,31 @@ mod tests {
     fn valid_config_has_no_diagnostics() {
         let diags = local_diagnostics(VALID, &schema());
         assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn github_app_keys_are_known_and_a_valid_app_config_is_clean() {
+        let text = VALID.replace(
+            "\"repository_branch\": \"main\",",
+            "\"repository_branch\": \"main\",\n    \"github_app\": true,\n    \"auto_deploy\": true,",
+        );
+        let diags = local_diagnostics(&text, &schema());
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn github_app_with_a_token_anchors_on_service_secret() {
+        let text = VALID.replace(
+            "\"repository_branch\": \"main\",",
+            "\"repository_branch\": \"main\",\n    \"github_app\": true,\n    \"service_secret\": \"tok\",",
+        );
+        let diags = local_diagnostics(&text, &schema());
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("don't use an access token"))
+            .expect("github_app diagnostic");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[d.range.start.line as usize].contains("service_secret"));
     }
 
     #[test]

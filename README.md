@@ -108,6 +108,7 @@ These flags work on every command:
 | `partiri auth`      | Sign in (`auth login`) or paste a key (`auth set-apikey`)                   |
 | `partiri init`      | Create `.partiri.jsonc` — interactive wizard by default; `--template` writes a non-interactive commented scaffold |
 | `partiri validate`  | Validate the local `.partiri.jsonc`; `--remote` also runs live API checks (UUIDs exist, region/pod pairing, repo/registry reachability, health-check probe) |
+| `partiri github`    | GitHub App integration: `status`, `setup`, `repos` (see [GitHub App](#github-app)) |
 
 ### `partiri service <subcommand>`
 
@@ -126,7 +127,38 @@ These flags work on every command:
 | `partiri service kill`       | Kill the service (requires confirmation)                           |
 | `partiri service link`       | Fill in workspace, project, region and pod UUIDs interactively     |
 | `partiri service env`        | Print, upload, or save runtime environment variables               |
-| `partiri service token`      | Link an auth token to this service (private repos / registries)    |
+| `partiri service token`      | Link an auth token to this service (private repos / registries); refused on GitHub App services |
+| `partiri service github connect` | Move the service onto the GitHub App (`--repo <owner/repo>`, `--branch <b>`; requires confirmation) |
+| `partiri service github disconnect` | Take the service off the GitHub App (requires confirmation)      |
+| `partiri service previews`   | Show pull-request preview settings and live previews; `enable [--pod <UUID>] [--share-secrets \| --no-share-secrets]` and `disable` (require confirmation) |
+
+### GitHub App
+
+Deploy a GitHub repository without an access token or a webhook: the Partiri GitHub App
+clones it, and every push to the branch deploys the service. It is available in workspaces
+where the App is enabled; everything below is skipped otherwise.
+
+```bash
+partiri github setup      # open the dashboard: connect GitHub, install the App (once)
+partiri github status     # connection, linked accounts
+partiri github repos      # repositories the App can see (--search <text>, --page <n>)
+```
+
+The GitHub connection belongs to the API key's owner and is made in the dashboard
+(workspace settings, GitHub card). `partiri init` asks "How should Partiri access
+<owner/repo>?" only when the repository is on GitHub and the App is available; choosing the
+App writes `"github_app": true` and `"auto_deploy": true` to `.partiri.jsonc`.
+
+- `service create` with `github_app: true` checks the repository and branch first and
+  never falls back to a token. `validate --remote` runs the same checks.
+- A GitHub App service's source is fixed: `service push` refuses a different repository, a
+  `service_secret` or a `registry_url`. Change it with
+  `partiri service github connect [--repo <owner/repo>] [--branch <b>]` (a token-based
+  service is redeployed right away; remove its old webhook on GitHub) or
+  `partiri service github disconnect` (a private repository then needs a token again).
+- `partiri service previews enable` gives each open pull request its own preview service. A
+  pod-month is charged when a preview is created and unused time is refunded when it is
+  removed; the command states the price and asks first.
 
 ### `partiri projects <subcommand>`
 
@@ -471,7 +503,9 @@ Install or remove the Partiri MCP server in AI tools. Valid `--client` slugs: `c
 | `service.repository_url`           | *Either*  | Git repository URL. Mutually exclusive with `registry_url`.                 |
 | `service.repository_branch`        | Cond.     | Branch to deploy. Required when `repository_url` is set.                    |
 | `service.registry_url`             | *Either*  | Full container image reference (e.g. `ghcr.io/owner/image:tag`). The API splits host, repository, and tag server-side. Mutually exclusive with `repository_url`; not supported for `static`. |
-| `service.service_secret`        | Cond.     | Secret UUID for private repo/registry access. Set via `partiri service token`. |
+| `service.service_secret`        | Cond.     | Secret UUID for private repo/registry access. Set via `partiri service token`. Not used with `github_app`. |
+| `service.github_app`               | No        | `true` deploys through the Partiri GitHub App (no token, deploys on push). Needs a GitHub `repository_url` and a branch; no `service_secret` or `registry_url`. A local marker: never sent to the API. Written by `init`, `service pull` and `service github connect`. |
+| `service.auto_deploy`              | No        | Deploy on every push to the branch. Written only on the GitHub App paths. |
 | `service.build_command`            | Cond.     | Build command. Required for repository sources on non-static runtimes.      |
 | `service.build_path`               | No        | Build output directory (e.g. `dist`).                                       |
 | `service.pre_deploy_command`       | No        | Command run before each deploy (e.g. DB migrations).                        |

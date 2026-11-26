@@ -42,7 +42,7 @@ Envelopes:
   "schema_version": "1",
   "ok": false,
   "error": {
-    "code": "401",                            // HTTP status as string OR literal: validation/auth/network/config/cancelled/conflict/missing_dependency
+    "code": "401",                            // HTTP status as string OR literal: validation/auth/network/config/cancelled/conflict/missing_dependency/github
     "message": "Unauthorized",
     "hint": "Your API key may have expired or been revoked. Run 'partiri auth login' to sign in again.",
     "likely_causes": ["…"],
@@ -365,6 +365,32 @@ counting the wrap into the next hour only when the hour field lets two consecuti
 fire. A field it cannot expand is passed through for the API's real cron parser to judge —
 so `validate` passing is not a guarantee the schedule is accepted.
 
+### Deploy through the GitHub App (no token)
+
+```bash
+partiri -j github status --workspace <UUID>      # state: connected | reauth_required | not_connected | unavailable
+partiri -j github repos --workspace <UUID> --search <text> [--page <n>]   # data: {repositories, installations: [{account,total,page,has_more,truncated}], skipped: [{account,reason}]}
+partiri llm template --source github            # config with "github_app": true
+partiri -j validate --remote                    # GitHub identity, repository, branch
+partiri -j -y service create                    # never falls back to a token
+```
+
+- `has_more` means another page exists (`--page <n+1>`); `truncated` means the API's 2000-repository cap, so refine with `--search`. Installations the caller's GitHub account can't see, or that are suspended, are listed under `skipped`, not failed.
+- The GitHub connection belongs to the API key's owner and can only be made in the dashboard
+  (`partiri github setup` opens it). When `state` is `not_connected` or `reauth_required`,
+  tell the user to connect GitHub and retry; do not work around it with a token.
+- `github_app: true` needs a GitHub `repository_url`, a `repository_branch`, and no
+  `service_secret` / `registry_url`. The marker is local: it is never sent to the API.
+- `partiri service push` refuses to change the source of an App service. To move a service
+  onto or off the App use `partiri -j -y service github connect [--repo <owner/repo>]` /
+  `partiri -j -y service github disconnect`: both redeploy or stop deploying, so state the
+  side effects to the user first. After `disconnect` a private repository needs a token
+  (`partiri service token --secret <id>`, then `partiri service push`).
+- Preview environments: `partiri -j service previews`, then
+  `partiri -j -y service previews enable` (a pod-month is charged per preview) or `disable`.
+- `partiri -j service jobs` carries `trigger` (`github_push`, `manual`, `deploy_hook`,
+  `rollback`, `preview`); `service metrics` carries `service.source` for an App service.
+
 ### Set runtime environment variables
 
 Env vars are never stored in `.partiri.jsonc`. Manage them with `partiri service env`:
@@ -445,7 +471,14 @@ it ahead of time: when a command fails, **read `error.suggested_commands` first*
 Codes are either an HTTP status rendered as a string (`"400"`, `"401"`, `"402"`,
 `"403"`, `"404"`, `"409"`, `"422"`, `"429"`, `5xx`) or one of the CLI-literal
 codes: `auth`, `validation`, `network`, `config`, `cancelled`,
-`missing_dependency`.
+`missing_dependency`, `github`. `github` marks a GitHub check the CLI ran itself
+(for example resolving `owner/repo` in the workspace's installations): it always
+carries an `api_code`, and there is no HTTP status.
+
+Errors from the GitHub integration keep `code` as the HTTP status and add `api_code`, e.g.
+`github_identity_required`, `github_repo_not_accessible`, `github_branch_not_found`,
+`installation_suspended`, `github_registry_switch_forbidden`, `previews_disabled`,
+`preview_service_managed`. The full list is in `partiri llm errors`; the `hint` says what to do.
 
 ## 9. Common pitfalls
 

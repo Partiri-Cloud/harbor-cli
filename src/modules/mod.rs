@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod common;
 pub mod databases;
+pub mod github;
 pub mod init;
 pub mod jobs;
 pub mod llm;

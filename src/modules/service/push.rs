@@ -13,9 +13,11 @@
 
 use owo_colors::OwoColorize;
 
-use crate::client::{ApiClient, RegionPricing, Volume};
+use crate::client::{ApiClient, RegionPricing, Service, Volume};
 use crate::config::PartiriConfig;
-use crate::error::Result;
+use crate::error::{CliError, Result};
+use crate::modules::github::parse_github_repo;
+use crate::modules::service::github::{live_repo, reject_preview, same_repo};
 use crate::modules::storage::find_service_volume;
 use crate::output::{ctx, print_success, print_success_with};
 
@@ -30,6 +32,10 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     // live volume and pricing for the cost delta and the divergence hint. All
     // are best-effort: a failure just drops the corresponding extra output.
     let live_service = client.read_service(id).ok();
+    let stale_marker = match &live_service {
+        Some(live) => github_push_guard(config, live)?,
+        None => false,
+    };
     let volumes = client.list_volumes(&config.project).ok();
     let pricing = client.get_pricing(&config.service.region).ok();
 
@@ -88,18 +94,19 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
     let disk_hint = disk_divergence_hint(config, current_vol.as_ref());
 
     if ctx().json {
-        print_success_with(
-            &format!("Service {} updated successfully.", id),
-            &serde_json::json!({
-                "id": id,
-                "current_monthly_pod_cost_eur": current_cost,
-                "desired_monthly_pod_cost_eur": desired_cost,
-                "cost_delta_eur": delta,
-                "current_max_cost_per_run_eur": current_run_cost,
-                "max_cost_per_run_eur": desired_run_cost,
-                "disk_hint": disk_hint,
-            }),
-        );
+        let mut data = serde_json::json!({
+            "id": id,
+            "current_monthly_pod_cost_eur": current_cost,
+            "desired_monthly_pod_cost_eur": desired_cost,
+            "cost_delta_eur": delta,
+            "current_max_cost_per_run_eur": current_run_cost,
+            "max_cost_per_run_eur": desired_run_cost,
+            "disk_hint": disk_hint,
+        });
+        if stale_marker {
+            data["github_note"] = serde_json::json!(STALE_MARKER_NOTE);
+        }
+        print_success_with(&format!("Service {} updated successfully.", id), &data);
     } else {
         print_success(&format!("Service {} updated successfully.", id));
         if let Some(d) = delta {
@@ -121,9 +128,65 @@ pub fn run(client: &ApiClient, config: &PartiriConfig) -> Result<()> {
         if let Some(hint) = &disk_hint {
             println!("  {} {}", "info:".cyan(), hint);
         }
+        if stale_marker {
+            println!("  {} {}", "info:".cyan(), STALE_MARKER_NOTE);
+        }
     }
 
     Ok(())
+}
+
+const STALE_MARKER_NOTE: &str = "This service deploys through the GitHub App; run `partiri service pull` to refresh `.partiri.jsonc`.";
+
+fn push_refusal(message: impl Into<String>, hint: &str) -> Box<CliError> {
+    Box::new(
+        CliError::new("validation", message)
+            .with_hint(hint)
+            .enriched(),
+    )
+}
+
+/// Refuse the pushes that would break the source of a GitHub App service (or of a
+/// preview), or that claim an App service that is not one. Returns `true` when the
+/// live service is an App service but the local config lacks the `github_app`
+/// marker (an older CLI dropped it): the push goes ahead and the caller prints a
+/// hint. Services that are not involved with the GitHub App are never affected.
+fn github_push_guard(config: &PartiriConfig, live: &Service) -> Result<bool> {
+    reject_preview(live)?;
+    let svc = &config.service;
+    if !live.is_github_app() {
+        if svc.is_github_app() {
+            return Err(push_refusal(
+                "This service isn't connected to the GitHub App.",
+                "Run 'partiri service github connect', or remove github_app from the config.",
+            ));
+        }
+        return Ok(false);
+    }
+    let wanted = svc.repository_url.as_deref().and_then(parse_github_repo);
+    let fixed = match (&wanted, live_repo(live)) {
+        (Some(w), Some(l)) => same_repo(w, &l),
+        _ => false,
+    };
+    if svc.registry_url.as_deref().is_some_and(|u| !u.is_empty()) {
+        return Err(push_refusal(
+            "This service deploys from GitHub; registry_url can't be set on it.",
+            "Disconnect it first: 'partiri service github disconnect'.",
+        ));
+    }
+    if !fixed {
+        return Err(push_refusal(
+            "The repository of a GitHub App service is fixed.",
+            "To use another repository: 'partiri service github connect --repo <owner/repo>'.",
+        ));
+    }
+    if svc.service_secret.as_deref().is_some_and(|s| !s.is_empty()) {
+        return Err(push_refusal(
+            "GitHub App services don't use an access token. Remove service_secret from the config.",
+            "To use a token instead, disconnect first: 'partiri service github disconnect'.",
+        ));
+    }
+    Ok(!svc.is_github_app())
 }
 
 /// Worst-case cost of a single cronjob run: the kill-timeout rounded up to whole
@@ -231,6 +294,103 @@ mod tests {
 
     // 43200 minutes a month, so a €43.20/month pod is €0.001/minute. A 10-minute
     // deadline is 10 of those.
+    fn live(v: serde_json::Value) -> Service {
+        let mut base = serde_json::json!({
+            "id": "svc-1", "name": "web", "deploy_type": "webservice", "runtime": "node"
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(v.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn app_live() -> Service {
+        live(serde_json::json!({
+            "github_repo_id": 42, "github_repo_full_name": "acme/web",
+            "repository_url": "https://github.com/acme/web"
+        }))
+    }
+
+    fn app_config() -> PartiriConfig {
+        let mut c = config_with_disk("pod-a", None);
+        c.service.repository_url = Some("https://github.com/Acme/Web.git".into());
+        c.service.github_app = Some(true);
+        c
+    }
+
+    #[test]
+    fn guard_ignores_services_that_never_used_the_github_app() {
+        let cfg = config_with_disk("pod-a", None);
+        assert!(!github_push_guard(&cfg, &live(serde_json::json!({}))).unwrap());
+    }
+
+    #[test]
+    fn guard_lets_a_matching_app_service_through() {
+        assert!(!github_push_guard(&app_config(), &app_live()).unwrap());
+    }
+
+    #[test]
+    fn guard_refuses_a_changed_repository() {
+        let mut cfg = app_config();
+        cfg.service.repository_url = Some("https://github.com/acme/other".into());
+        let err = github_push_guard(&cfg, &app_live())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("fixed") && err.contains("service github connect --repo"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn guard_refuses_a_token_and_a_registry_on_an_app_service() {
+        let mut cfg = app_config();
+        cfg.service.service_secret = Some("tok".into());
+        let err = github_push_guard(&cfg, &app_live())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("don't use an access token"), "{err}");
+        let mut cfg = app_config();
+        cfg.service.registry_url = Some("ghcr.io/a/b:1".into());
+        let err = github_push_guard(&cfg, &app_live())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("github disconnect"), "{err}");
+    }
+
+    #[test]
+    fn guard_allows_a_branch_change() {
+        let mut cfg = app_config();
+        cfg.service.repository_branch = Some("release".into());
+        assert!(github_push_guard(&cfg, &app_live()).is_ok());
+    }
+
+    #[test]
+    fn guard_hints_when_the_marker_is_missing_locally() {
+        let mut cfg = app_config();
+        cfg.service.github_app = None;
+        assert!(github_push_guard(&cfg, &app_live()).unwrap());
+    }
+
+    #[test]
+    fn guard_refuses_the_marker_on_a_service_that_is_not_connected() {
+        let err = github_push_guard(&app_config(), &live(serde_json::json!({})))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("isn't connected to the GitHub App"), "{err}");
+    }
+
+    #[test]
+    fn guard_refuses_previews() {
+        let err = github_push_guard(
+            &app_config(),
+            &live(serde_json::json!({"fk_parent_service": "p"})),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("pull-request preview"), "{err}");
+    }
+
     #[test]
     fn max_run_cost_charges_the_deadline_in_whole_minutes() {
         let pricing = sample_pricing("pod-a", 43200.0 / 1000.0);

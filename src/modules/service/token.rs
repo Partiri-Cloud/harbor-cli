@@ -17,10 +17,23 @@ pub struct TokenArgs {
     pub clear: bool,
 }
 
+/// The refusal for setting an access token on a GitHub App service.
+pub(crate) fn app_token_error() -> CliError {
+    CliError::new(
+        "validation",
+        "GitHub App services don't use an access token.",
+    )
+    .with_hint("To use a token instead, disconnect first: 'partiri service github disconnect'.")
+    .enriched()
+}
+
 /// Entry point for `partiri service token`. With `--secret`/`--clear` it updates
 /// the config non-interactively; otherwise it lists the workspace's
 /// registry-or-repository secrets and prompts for a choice.
 pub fn run(client: &ApiClient, mut config: PartiriConfig, args: TokenArgs) -> Result<()> {
+    if config.service.is_github_app() {
+        return Err(Box::new(app_token_error()));
+    }
     if let Some(secret_id) = args.secret {
         config.service.service_secret = Some(secret_id.clone());
         config.save()?;
